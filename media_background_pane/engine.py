@@ -26,7 +26,58 @@ def _opaque_black(dest: np.ndarray) -> np.ndarray:
     return dest
 
 
-def _blend(program: np.ndarray, preview: np.ndarray, mix: float, dimmer: float) -> np.ndarray:
+# Natural vignetting ≈ cos⁴(θ) ≈ 1/(1+r²)² (cosine-fourth / Kino).
+# Cosine develops until fade progress 0.8, then that shape holds and the
+# whole frame eases to black so the hotspot never pinches to a dot.
+# Radius is shaped so the middle stays open while edges crush.
+# Exposure only — chromaticity is left alone.
+_VIGNETTE_LIMIT = 0.8
+_VIGNETTE_STRENGTH = 2.6
+_VIGNETTE_RADIUS = 1.85
+_VIGNETTE_GAMMA = 0.5
+
+
+def _vignette_r2(height: int, width: int) -> np.ndarray:
+    aspect = width / max(1, height)
+    ys = ((np.arange(height, dtype=np.float32) + 0.5) / height - 0.5) * 2.0
+    xs = ((np.arange(width, dtype=np.float32) + 0.5) / width - 0.5) * 2.0 * aspect
+    return xs[np.newaxis, :] ** 2 + ys[:, np.newaxis] ** 2
+
+
+def _smoothstep(edge0: float, edge1: float, x: float) -> float:
+    t = min(1.0, max(0.0, (x - edge0) / (edge1 - edge0)))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _apply_vignette_dim(frame: np.ndarray, dimmer: float, r2: np.ndarray) -> np.ndarray:
+    if dimmer <= 0.001:
+        return _opaque_black(np.empty_like(frame))
+    if dimmer >= 0.999:
+        return frame
+    progress = 1.0 - dimmer
+    vig = min(1.0, progress / _VIGNETTE_LIMIT) ** _VIGNETTE_GAMMA
+    falloff = vig * _VIGNETTE_STRENGTH
+    rf2 = np.power(r2, _VIGNETTE_RADIUS / 2.0) * (falloff * falloff)
+    cosine = 1.0 / np.square(rf2 + 1.0)
+    shade = cosine
+    tail = 1.0 - _smoothstep(_VIGNETTE_LIMIT - 0.04, 1.0, progress)
+    rgb = frame[..., :3].astype(np.float32) * (1.0 / 255.0)
+    lin = np.square(rgb)
+    lin *= shade[..., None]
+    lin *= tail
+    dimmed = np.empty_like(frame)
+    dimmed[..., :3] = (np.sqrt(np.clip(lin, 0.0, 1.0)) * 255.0).astype(np.uint8)
+    dimmed[..., 3] = 255
+    return dimmed
+
+
+def _blend(
+    program: np.ndarray,
+    preview: np.ndarray,
+    mix: float,
+    dimmer: float,
+    r2: np.ndarray,
+) -> np.ndarray:
     if dimmer <= 0.001:
         return _opaque_black(np.empty_like(program))
     if mix <= 0.001:
@@ -40,13 +91,7 @@ def _blend(program: np.ndarray, preview: np.ndarray, mix: float, dimmer: float) 
             np.uint8
         )
     if dimmer < 0.999:
-        level = np.uint16(round(max(0.0, min(1.0, dimmer)) * 256))
-        if level <= 0:
-            return _opaque_black(np.empty_like(out))
-        dimmed = np.empty_like(out)
-        dimmed[..., :3] = ((out[..., :3].astype(np.uint16) * level) >> 8).astype(np.uint8)
-        dimmed[..., 3] = 255
-        return dimmed
+        return _apply_vignette_dim(out, dimmer, r2)
     return out
 
 
@@ -72,6 +117,7 @@ class Engine(QObject):
         self.dimmer = 1.0
         self._pgm_np = np.zeros((height, width, 4), dtype=np.uint8)
         self._pvw_np = np.zeros((height, width, 4), dtype=np.uint8)
+        self._vignette_r2 = _vignette_r2(height, width)
         self._sender = NdiSender(config.ndi_name, config.fps, width, height)
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.CoarseTimer)
@@ -120,9 +166,9 @@ class Engine(QObject):
         self._copy_frame(self.program.frame, self._pgm_np)
         if self.mix > 0.001:
             self._copy_frame(self.preview.frame, self._pvw_np)
-            mixed = _blend(self._pgm_np, self._pvw_np, self.mix, self.dimmer)
+            mixed = _blend(self._pgm_np, self._pvw_np, self.mix, self.dimmer, self._vignette_r2)
         else:
-            mixed = _blend(self._pgm_np, self._pgm_np, 0.0, self.dimmer)
+            mixed = _blend(self._pgm_np, self._pgm_np, 0.0, self.dimmer, self._vignette_r2)
         self._sender.submit_array(mixed)
         if self._gui_enabled:
             wrapper = QImage(
@@ -191,6 +237,7 @@ class Engine(QObject):
         self.program.set_process_size(width, height)
         self._pgm_np = np.zeros((height, width, 4), dtype=np.uint8)
         self._pvw_np = np.zeros((height, width, 4), dtype=np.uint8)
+        self._vignette_r2 = _vignette_r2(height, width)
         self._sender.set_size(width, height)
         self.ndi_status_changed.emit(self._sender.status, self._sender.available)
 
@@ -285,9 +332,9 @@ class Engine(QObject):
             self._copy_frame(self.program.frame, self._pgm_np)
             if self.mix > 0.001:
                 self._copy_frame(self.preview.frame, self._pvw_np)
-                mixed = _blend(self._pgm_np, self._pvw_np, self.mix, self.dimmer)
+                mixed = _blend(self._pgm_np, self._pvw_np, self.mix, self.dimmer, self._vignette_r2)
             else:
-                mixed = _blend(self._pgm_np, self._pgm_np, 0.0, self.dimmer)
+                mixed = _blend(self._pgm_np, self._pgm_np, 0.0, self.dimmer, self._vignette_r2)
             self._sender.submit_array(mixed)
             if self._gui_enabled:
                 self._gui_n += 1
