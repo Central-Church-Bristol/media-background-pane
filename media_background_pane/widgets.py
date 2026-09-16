@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
@@ -16,6 +17,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QStyle,
+    QStyleOptionSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -498,10 +501,245 @@ class LabeledSwitch(QWidget):
         self._switch.setToolTip(tip)
 
 
+class ChaseSlider(QSlider):
+    """Slider whose handle chases a ghost target at fade-duration-limited speed."""
+
+    chase_finished = Signal()
+
+    def __init__(self, orientation: Qt.Orientation, parent: QWidget | None = None) -> None:
+        super().__init__(orientation, parent)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._ghost = 0
+        self._pos = 0.0
+        self._vel = 0.0
+        self._fade_seconds = 10.0
+        self._dragging = False
+        self._chasing = False
+        self._show_ghost = False
+        self._last_tick = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def set_fade_seconds(self, seconds: float) -> None:
+        self._fade_seconds = max(0.05, float(seconds))
+
+    def is_chasing(self) -> bool:
+        return self._chasing
+
+    def setValue(self, value: int) -> None:
+        super().setValue(value)
+        if not self._chasing:
+            self._pos = float(self.value())
+            if not self._dragging:
+                self._ghost = self.value()
+
+    def snap_to(self, value: int) -> None:
+        self._timer.stop()
+        self._chasing = False
+        self._vel = 0.0
+        value = max(self.minimum(), min(self.maximum(), int(value)))
+        self._ghost = value
+        self._pos = float(value)
+        self._show_ghost = False
+        if self.value() != value:
+            super().setValue(value)
+        self.update()
+
+    def stop_chase(self) -> None:
+        if not self._chasing and not self._show_ghost:
+            self._vel = 0.0
+            return
+        self._timer.stop()
+        self._chasing = False
+        self._vel = 0.0
+        self._ghost = int(round(self._pos))
+        self._show_ghost = False
+        snapped = max(self.minimum(), min(self.maximum(), self._ghost))
+        self._pos = float(snapped)
+        if self.value() != snapped:
+            super().setValue(snapped)
+        self.update()
+
+    def set_target(self, value: int) -> None:
+        value = max(self.minimum(), min(self.maximum(), int(value)))
+        self._ghost = value
+        if abs(self._pos - value) < 0.5 and abs(self._vel) < 0.05:
+            self._pos = float(value)
+            if self.value() != value:
+                super().setValue(value)
+            if not self._dragging:
+                self._show_ghost = False
+                if self._chasing:
+                    self._finish_chase(emit_finished=True)
+            self.update()
+            return
+        self._show_ghost = True
+        self._ensure_chase()
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+        self._dragging = True
+        self.sliderPressed.emit()
+        self.set_target(self._value_from_pos(event.position()))
+        self.grabMouse()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._dragging:
+            event.ignore()
+            return
+        self.set_target(self._value_from_pos(event.position()))
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or not self._dragging:
+            event.ignore()
+            return
+        self._dragging = False
+        self.set_target(self._value_from_pos(event.position()))
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
+        self.sliderReleased.emit()
+        event.accept()
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        step = 40
+        origin = self._ghost if (self._chasing or self._dragging) else self.value()
+        self.set_target(origin + (step if delta > 0 else -step))
+        event.accept()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._show_ghost or abs(self._ghost - self.value()) < 2:
+            return
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        opt.sliderPosition = self._ghost
+        opt.sliderValue = self._ghost
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            opt,
+            QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        if handle.isEmpty():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QColor("#8e8e93"))
+        painter.setPen(QPen(QColor("#636366"), 1))
+        painter.drawEllipse(handle)
+        painter.end()
+
+    def _value_from_pos(self, pos) -> int:
+        point = pos.toPoint() if hasattr(pos, "toPoint") else QPoint(int(pos.x()), int(pos.y()))
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            opt,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            opt,
+            QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        if self.orientation() == Qt.Orientation.Horizontal:
+            slider_min = groove.x()
+            slider_max = groove.right() - handle.width() + 1
+            pos_val = point.x() - handle.width() // 2
+        else:
+            slider_min = groove.y()
+            slider_max = groove.bottom() - handle.height() + 1
+            pos_val = point.y() - handle.height() // 2
+        span = max(1, int(slider_max - slider_min))
+        return QStyle.sliderValueFromPosition(
+            self.minimum(),
+            self.maximum(),
+            int(pos_val - slider_min),
+            span,
+            opt.upsideDown,
+        )
+
+    def _ensure_chase(self) -> None:
+        if self._chasing:
+            return
+        self._chasing = True
+        self._last_tick = monotonic()
+        self._timer.start()
+
+    def _finish_chase(self, emit_finished: bool = True) -> None:
+        self._timer.stop()
+        self._chasing = False
+        self._vel = 0.0
+        snapped = max(self.minimum(), min(self.maximum(), int(round(self._ghost))))
+        self._pos = float(snapped)
+        self._ghost = snapped
+        if not self._dragging:
+            self._show_ghost = False
+        if self.value() != snapped:
+            super().setValue(snapped)
+        self.update()
+        if emit_finished and not self._dragging:
+            self.chase_finished.emit()
+
+    def _tick(self) -> None:
+        now = monotonic()
+        dt = min(0.05, max(0.001, now - self._last_tick))
+        self._last_tick = now
+        fade = max(0.05, self._fade_seconds)
+        ease_time = max(0.06, 0.10 * fade)
+        max_v = 1000.0 / max(fade - ease_time, 0.05)
+        accel = max_v / ease_time
+        remaining = self._ghost - self._pos
+        dist = abs(remaining)
+        if dist < 0.4 and abs(self._vel) < max_v * 0.02:
+            self._finish_chase()
+            return
+        direction = 1.0 if remaining > 0 else -1.0
+        stop_dist = (self._vel * self._vel) / (2.0 * accel) if accel > 0 else 0.0
+        if self._vel * remaining < 0:
+            dv = accel * dt
+            if abs(self._vel) <= dv:
+                self._vel = 0.0
+            else:
+                self._vel -= dv if self._vel > 0 else -dv
+        elif dist <= stop_dist:
+            dv = accel * dt
+            if abs(self._vel) <= dv:
+                self._vel = 0.0
+            else:
+                self._vel -= dv if self._vel > 0 else -dv
+        else:
+            self._vel += direction * accel * dt
+            self._vel = max(-max_v, min(max_v, self._vel))
+        self._pos += self._vel * dt
+        if (direction > 0 and self._pos >= self._ghost) or (direction < 0 and self._pos <= self._ghost):
+            self._finish_chase()
+            return
+        self._pos = max(float(self.minimum()), min(float(self.maximum()), self._pos))
+        new_val = int(round(self._pos))
+        if new_val != self.value():
+            super().setValue(new_val)
+        self.update()
+
+
 class LabeledSlider(QWidget):
     value_changed = Signal(int)
     pressed = Signal()
     released = Signal()
+    chase_finished = Signal()
 
     def __init__(
         self,
@@ -513,13 +751,14 @@ class LabeledSlider(QWidget):
         caption = QLabel(label)
         caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         caption.setObjectName("SliderLabel")
-        self.slider = QSlider(orientation)
+        self.slider = ChaseSlider(orientation)
         self.slider.setRange(0, 1000)
         self.slider.setValue(0)
         self.slider.setTickPosition(QSlider.TickPosition.NoTicks)
         self.slider.valueChanged.connect(self.value_changed.emit)
         self.slider.sliderPressed.connect(self.pressed.emit)
         self.slider.sliderReleased.connect(self.released.emit)
+        self.slider.chase_finished.connect(self.chase_finished.emit)
         if orientation == Qt.Orientation.Horizontal:
             self.setObjectName("MixSlider")
             layout = QHBoxLayout(self)
@@ -537,3 +776,12 @@ class LabeledSlider(QWidget):
             layout.addWidget(caption)
             layout.addWidget(self.slider, 1)
             self.setFixedWidth(36)
+
+    def set_fade_seconds(self, seconds: float) -> None:
+        self.slider.set_fade_seconds(seconds)
+
+    def set_target(self, value: int) -> None:
+        self.slider.set_target(value)
+
+    def snap_to(self, value: int) -> None:
+        self.slider.snap_to(value)

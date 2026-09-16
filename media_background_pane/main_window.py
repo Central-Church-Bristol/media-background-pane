@@ -4,7 +4,6 @@ from pathlib import Path
 from time import monotonic
 
 from PySide6.QtCore import (
-    QEasingCurve,
     QFileSystemWatcher,
     QPoint,
     QPointF,
@@ -12,7 +11,6 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
-    QVariantAnimation,
 )
 from PySide6.QtGui import QColor, QGuiApplication, QIcon, QImage, QPainter, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
@@ -181,7 +179,9 @@ class MainWindow(QWidget):
         self.program_monitor = MonitorWidget("PROGRAM", "program")
         self.mix_slider = LabeledSlider("MIX", Qt.Orientation.Horizontal)
         self.dim_slider = LabeledSlider("DIM")
-        self.dim_slider.slider.setValue(1000)
+        self.mix_slider.set_fade_seconds(self.config.fade_seconds)
+        self.dim_slider.set_fade_seconds(self.config.fade_seconds)
+        self.dim_slider.snap_to(1000)
         self.fade_button = QPushButton("FADE")
         self.fade_button.setObjectName("FadeButton")
         self.fade_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -225,24 +225,14 @@ class MainWindow(QWidget):
         self.mix_slider.pressed.connect(self._on_mix_pressed)
         self.mix_slider.released.connect(self._on_mix_released)
         self.mix_slider.value_changed.connect(self._on_mix_changed)
+        self.mix_slider.chase_finished.connect(self._on_mix_chase_finished)
         self.dim_slider.pressed.connect(self._on_dim_pressed)
         self.dim_slider.value_changed.connect(self._on_dim_changed)
+        self.dim_slider.chase_finished.connect(self._on_dim_chase_finished)
 
         self.engine.preview_changed.connect(self.preview_monitor.set_image)
         self.engine.program_changed.connect(self.program_monitor.set_image)
         self.engine.taken.connect(self._on_taken)
-
-        ease = QEasingCurve(QEasingCurve.Type.InOutCubic)
-        self._animation = QVariantAnimation(self)
-        self._animation.setDuration(1000)
-        self._animation.setEasingCurve(ease)
-        self._animation.valueChanged.connect(self._on_anim_value)
-        self._animation.finished.connect(self._on_anim_finished)
-        self._dim_animation = QVariantAnimation(self)
-        self._dim_animation.setDuration(1000)
-        self._dim_animation.setEasingCurve(ease)
-        self._dim_animation.valueChanged.connect(self._on_dim_anim_value)
-        self._dim_animation.finished.connect(self._on_dim_anim_finished)
 
         self.preview_monitor.setMaximumWidth(200)
         self.program_monitor.setMaximumWidth(200)
@@ -787,14 +777,9 @@ class MainWindow(QWidget):
         if current <= 0.001:
             self._finish_mix_down()
             return
-        duration_ms = int(self.config.fade_seconds * 1000 * current)
         self._mix_anim_mode = "down"
         self._animating = True
-        self._animation.stop()
-        self._animation.setStartValue(current)
-        self._animation.setEndValue(0.0)
-        self._animation.setDuration(max(50, duration_ms))
-        self._animation.start()
+        self.mix_slider.set_target(0)
 
     def _start_mix_up_for_swap(self) -> None:
         self._stop_dim_animation()
@@ -802,20 +787,12 @@ class MainWindow(QWidget):
         if current >= 0.999:
             self._finish_mix_up_then_swap()
             return
-        remaining = max(0.05, 1.0 - current)
-        duration_ms = int(self.config.fade_seconds * 1000 * remaining)
         self._mix_anim_mode = "up_swap"
         self._animating = True
-        self._animation.stop()
-        self._animation.setStartValue(current)
-        self._animation.setEndValue(1.0)
-        self._animation.setDuration(max(50, duration_ms))
-        self._animation.start()
+        self.mix_slider.set_target(1000)
 
     def _finish_mix_down(self) -> None:
-        self.mix_slider.slider.blockSignals(True)
-        self.mix_slider.slider.setValue(0)
-        self.mix_slider.slider.blockSignals(False)
+        self.mix_slider.snap_to(0)
         self.engine.set_mix(0.0)
         path = self._pending_preview_path
         self._pending_preview_path = None
@@ -825,9 +802,7 @@ class MainWindow(QWidget):
         self._arm_auto_fade_if_needed()
 
     def _finish_mix_up_then_swap(self) -> None:
-        self.mix_slider.slider.blockSignals(True)
-        self.mix_slider.slider.setValue(1000)
-        self.mix_slider.slider.blockSignals(False)
+        self.mix_slider.snap_to(1000)
         self.engine.set_mix(1.0)
         self.engine.take()
         path = self._pending_preview_path
@@ -848,9 +823,7 @@ class MainWindow(QWidget):
 
     def _on_taken(self) -> None:
         self._sync_thumb_roles()
-        self.mix_slider.slider.blockSignals(True)
-        self.mix_slider.slider.setValue(0)
-        self.mix_slider.slider.blockSignals(False)
+        self.mix_slider.snap_to(0)
         self._update_fade_enabled()
 
     def _update_fade_enabled(self) -> None:
@@ -859,22 +832,21 @@ class MainWindow(QWidget):
     def _cycle_duration(self) -> None:
         seconds = self.config.cycle_fade()
         self.duration_button.setText(f"{seconds}s")
+        self.mix_slider.set_fade_seconds(seconds)
+        self.dim_slider.set_fade_seconds(seconds)
         self.config.save()
 
     def _stop_mix_animation(self) -> None:
-        if self._animating:
-            self._animating = False
-            self._animation.stop()
+        self._animating = False
         self._mix_anim_mode = None
         self._pending_preview_path = None
+        self.mix_slider.slider.stop_chase()
 
     def _stop_dim_animation(self) -> None:
         if not self._dim_animating:
             return
         self._dim_animating = False
-        self._dim_animation.blockSignals(True)
-        self._dim_animation.stop()
-        self._dim_animation.blockSignals(False)
+        self.dim_slider.slider.stop_chase()
 
     def _on_mix_pressed(self) -> None:
         try:
@@ -885,17 +857,40 @@ class MainWindow(QWidget):
         self._stop_mix_animation()
 
     def _on_mix_released(self) -> None:
+        if self.mix_slider.slider.is_chasing():
+            return
         if self.mix_slider.slider.value() >= 1000 and self.engine.preview.has_source:
             self.engine.take()
 
     def _on_mix_changed(self, value: int) -> None:
         self.engine.set_mix(value / 1000.0)
 
+    def _on_mix_chase_finished(self) -> None:
+        mode = self._mix_anim_mode
+        self._mix_anim_mode = None
+        self._animating = False
+        if mode == "down":
+            self._finish_mix_down()
+            return
+        if mode == "up_swap":
+            self._finish_mix_up_then_swap()
+            return
+        if self.mix_slider.slider.value() >= 1000 and self.engine.preview.has_source:
+            self.engine.take()
+
     def _on_dim_pressed(self) -> None:
-        self._stop_dim_animation()
+        self._dim_animating = False
+        self.dim_slider.slider.stop_chase()
 
     def _on_dim_changed(self, value: int) -> None:
-        self.engine.set_dimmer(value / 1000.0)
+        chasing = self.dim_slider.slider.is_chasing()
+        self.engine.set_dimmer(value / 1000.0, allow_pause=not chasing)
+        self._update_black_button()
+
+    def _on_dim_chase_finished(self) -> None:
+        self._dim_animating = False
+        amount = self.dim_slider.slider.value() / 1000.0
+        self.engine.set_dimmer(amount, allow_pause=True)
         self._update_black_button()
 
     def _fully_black(self) -> bool:
@@ -923,15 +918,9 @@ class MainWindow(QWidget):
         if current >= 0.999:
             self.engine.take()
             return
-        remaining = max(0.05, 1.0 - current)
-        duration_ms = int(self.config.fade_seconds * 1000 * remaining)
         self._mix_anim_mode = "up"
         self._animating = True
-        self._animation.stop()
-        self._animation.setStartValue(current)
-        self._animation.setEndValue(1.0)
-        self._animation.setDuration(max(50, duration_ms))
-        self._animation.start()
+        self.mix_slider.set_target(1000)
 
     def _start_black_fade(self) -> None:
         try:
@@ -940,68 +929,15 @@ class MainWindow(QWidget):
             pass
         self._pending_auto_fade = False
         self._stop_mix_animation()
-        self._stop_dim_animation()
         current = float(self.engine.dimmer)
         target = 1.0 if current <= 0.001 else 0.0
         if abs(target - current) < 0.001:
-            self.dim_slider.slider.blockSignals(True)
-            self.dim_slider.slider.setValue(int(round(target * 1000)))
-            self.dim_slider.slider.blockSignals(False)
+            self.dim_slider.snap_to(int(round(target * 1000)))
             self.engine.set_dimmer(target, allow_pause=True)
             self._update_black_button()
             return
-        span = abs(target - current)
-        duration_ms = int(self.config.fade_seconds * 1000 * max(0.05, span))
-        self._dim_animation.blockSignals(True)
-        self._dim_animation.stop()
-        self._dim_animation.setStartValue(current)
-        self._dim_animation.setEndValue(target)
-        self._dim_animation.setDuration(max(50, duration_ms))
-        self._dim_animation.setCurrentTime(0)
-        self._dim_animation.blockSignals(False)
         self._dim_animating = True
-        self._dim_animation.start()
-
-    def _on_anim_value(self, value: object) -> None:
-        amount = float(value)
-        self.mix_slider.slider.blockSignals(True)
-        self.mix_slider.slider.setValue(int(amount * 1000))
-        self.mix_slider.slider.blockSignals(False)
-        self.engine.set_mix(amount)
-
-    def _on_anim_finished(self) -> None:
-        if not self._animating:
-            return
-        mode = self._mix_anim_mode
-        self._animating = False
-        self._mix_anim_mode = None
-        if mode == "down":
-            self._finish_mix_down()
-            return
-        if mode == "up_swap":
-            self._finish_mix_up_then_swap()
-            return
-        self.engine.take()
-
-    def _on_dim_anim_value(self, value: object) -> None:
-        amount = float(value)
-        self.dim_slider.slider.blockSignals(True)
-        self.dim_slider.slider.setValue(int(round(amount * 1000)))
-        self.dim_slider.slider.blockSignals(False)
-        # Don't pause/unpause mid-fade — that caused a black flash on reverse.
-        self.engine.set_dimmer(amount, allow_pause=False)
-        self._update_black_button()
-
-    def _on_dim_anim_finished(self) -> None:
-        if not self._dim_animating:
-            return
-        self._dim_animating = False
-        target = float(self._dim_animation.endValue())
-        self.dim_slider.slider.blockSignals(True)
-        self.dim_slider.slider.setValue(int(round(target * 1000)))
-        self.dim_slider.slider.blockSignals(False)
-        self.engine.set_dimmer(target, allow_pause=True)
-        self._update_black_button()
+        self.dim_slider.set_target(int(round(target * 1000)))
 
     def _open_settings(self) -> None:
         status, _ok = self.engine.ndi_status
