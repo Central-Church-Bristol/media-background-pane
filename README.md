@@ -10,6 +10,7 @@ Built for [Central Church Bristol](https://github.com/Central-Church-Bristol).
 - Preview / program buses with MIX, DIM, a fade take, and Fade to Black
 - MIX and DIM don’t jump: a darker grey ghost handle follows the pointer, and the live handle eases toward it at the fade duration (same motion as FADE, Auto Fade, and Fade to Black)
 - DIM and Fade to Black close a camera-style vignette: edges darken first (colour stays the same), then from about 80% faded the whole frame eases to black
+- With DIM at black, FADE still takes preview to program without decoding (output stays black); PREVIEW and the thumbnail selection update so you can see the swap
 - Sends output as an NDI source named **Media Background Pane**
 - Can sit on top of ProPresenter, start with Windows, and show itself when a named workspace is open
 - Can trigger ProPresenter’s first video input on startup

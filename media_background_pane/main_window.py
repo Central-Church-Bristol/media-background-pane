@@ -774,7 +774,7 @@ class MainWindow(QWidget):
     def _start_mix_down(self) -> None:
         self._stop_dim_animation()
         current = self.mix_slider.slider.value() / 1000.0
-        if current <= 0.001:
+        if current <= 0.001 or self.engine.dimmer <= 0.001:
             self._finish_mix_down()
             return
         self._mix_anim_mode = "down"
@@ -784,7 +784,7 @@ class MainWindow(QWidget):
     def _start_mix_up_for_swap(self) -> None:
         self._stop_dim_animation()
         current = self.mix_slider.slider.value() / 1000.0
-        if current >= 0.999:
+        if current >= 0.999 or self.engine.dimmer <= 0.001:
             self._finish_mix_up_then_swap()
             return
         self._mix_anim_mode = "up_swap"
@@ -914,6 +914,9 @@ class MainWindow(QWidget):
             return
         self._stop_dim_animation()
         self._pending_preview_path = None
+        if self.engine.dimmer <= 0.001:
+            self.engine.take()
+            return
         current = self.mix_slider.slider.value() / 1000.0
         if current >= 0.999:
             self.engine.take()

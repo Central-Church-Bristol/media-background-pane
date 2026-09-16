@@ -117,6 +117,8 @@ class Engine(QObject):
         self.dimmer = 1.0
         self._pgm_np = np.zeros((height, width, 4), dtype=np.uint8)
         self._pvw_np = np.zeros((height, width, 4), dtype=np.uint8)
+        self._black_np = np.zeros((height, width, 4), dtype=np.uint8)
+        _opaque_black(self._black_np)
         self._vignette_r2 = _vignette_r2(height, width)
         self._sender = NdiSender(config.ndi_name, config.fps, width, height)
         self._timer = QTimer(self)
@@ -154,8 +156,7 @@ class Engine(QObject):
         return image
 
     def _submit_opaque_black(self) -> None:
-        _opaque_black(self._pgm_np)
-        self._sender.submit_array(self._pgm_np)
+        self._sender.submit_array(self._black_np)
         if self._gui_enabled:
             self.program_changed.emit(self._gui_black())
 
@@ -201,6 +202,8 @@ class Engine(QObject):
             self.preview.set_convert_enabled(True)
             return
         if self._blacked_out():
+            self.program.set_paused(True)
+            self.program.set_convert_enabled(False)
             self.preview.set_paused(True)
             self.preview.set_convert_enabled(False)
             return
@@ -237,6 +240,8 @@ class Engine(QObject):
         self.program.set_process_size(width, height)
         self._pgm_np = np.zeros((height, width, 4), dtype=np.uint8)
         self._pvw_np = np.zeros((height, width, 4), dtype=np.uint8)
+        self._black_np = np.zeros((height, width, 4), dtype=np.uint8)
+        _opaque_black(self._black_np)
         self._vignette_r2 = _vignette_r2(height, width)
         self._sender.set_size(width, height)
         self.ndi_status_changed.emit(self._sender.status, self._sender.available)
@@ -245,9 +250,10 @@ class Engine(QObject):
     def set_mix(self, value: float) -> None:
         was_idle = self._idle()
         self.mix = min(1.0, max(0.0, value))
-        self._sync_preview_convert()
-        if self._idle() != was_idle:
-            self._sync_timer()
+        if not self._blacked_out():
+            self._sync_preview_convert()
+            if self._idle() != was_idle:
+                self._sync_timer()
         self.mix_changed.emit(self.mix)
 
     @Slot(float)
@@ -292,6 +298,8 @@ class Engine(QObject):
                 if self._blacked_out():
                     self._submit_opaque_black()
                     self._set_playback_blackout(True)
+                    if self._gui_enabled:
+                        self.preview_changed.emit(_scale_gui(self.preview.frame))
                 else:
                     # Keep the current dimmer on the swapped frame. Submitting
                     # program.frame raw here flashed full brightness at fade end.
