@@ -7,7 +7,7 @@ from typing import Any
 from PySide6.QtCore import QStandardPaths
 
 APP_NAME = "Media Background Pane"
-FADE_DURATIONS = (1, 3, 5, 10, 20)
+FADE_DURATIONS = (1, 3, 5, 10, 20, 30)
 DEFAULT_FADE_SECONDS = 10
 OUTPUT_WIDTH = 1920
 OUTPUT_HEIGHT = 1080
