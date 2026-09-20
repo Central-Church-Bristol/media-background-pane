@@ -39,11 +39,15 @@ from .priority import prefer_livestream_apps
 from .propresenter import (
     PATH_SETTINGS,
     clear_video_input_layer,
+    apply_tool_window_style,
     is_propresenter_running,
     native_cursor_pos,
     native_window_rect,
+    propresenter_main_hwnd,
     propresenter_window_rect,
     set_visible_window_rect,
+    set_window_owner,
+    stack_window_above,
     trigger_first_video_input,
     video_input_layer_active,
     workspace_is_open,
@@ -324,6 +328,10 @@ class MainWindow(QWidget):
         self._snap_timer.setInterval(400)
         self._snap_timer.timeout.connect(self._snap_to_propresenter)
         self._snap_timer.start()
+        self._z_timer = QTimer(self)
+        self._z_timer.setInterval(100)
+        self._z_timer.timeout.connect(self._stack_above_propresenter)
+        self._z_timer.start()
         self._video_input_timer = QTimer(self)
         self._video_input_timer.setInterval(2000)
         self._video_input_timer.timeout.connect(self._try_trigger_video_input)
@@ -367,13 +375,12 @@ class MainWindow(QWidget):
 
     def _apply_window_flags(self) -> None:
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-        if self.config.always_on_top:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         QTimer.singleShot(0, self._hide_from_taskbar)
+        QTimer.singleShot(0, self._stack_above_propresenter)
         QTimer.singleShot(0, self.thumbs._fit_flow)
 
     def nativeEvent(self, eventType, message):
@@ -411,9 +418,6 @@ class MainWindow(QWidget):
         return super().nativeEvent(eventType, message)
 
     def _hide_from_taskbar(self) -> None:
-        import ctypes
-        from ctypes import wintypes
-
         hwnd = int(self.winId())
         if not hwnd:
             return
@@ -424,43 +428,9 @@ class MainWindow(QWidget):
             owner.resize(1, 1)
             owner.createWinId()
             self._taskbar_owner = owner
-        owner_hwnd = int(self._taskbar_owner.winId())
-        GWL_EXSTYLE = -20
-        GWLP_HWNDPARENT = -8
-        WS_EX_TOOLWINDOW = 0x00000080
-        WS_EX_APPWINDOW = 0x00040000
-        SWP_NOSIZE = 0x0001
-        SWP_NOMOVE = 0x0002
-        SWP_NOZORDER = 0x0004
-        SWP_NOACTIVATE = 0x0010
-        SWP_FRAMECHANGED = 0x0020
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
-        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
-        user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
-        user32.SetWindowPos.argtypes = [
-            wintypes.HWND,
-            wintypes.HWND,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint,
-        ]
-        user32.SetWindowPos.restype = wintypes.BOOL
-        user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner_hwnd)
-        ex = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
-        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
-        user32.SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        )
+        apply_tool_window_style(hwnd)
+        if not self.config.always_on_top:
+            set_window_owner(hwnd, int(self._taskbar_owner.winId()))
 
     def _pp_rect(self) -> QRect | None:
         raw = propresenter_window_rect()
@@ -550,7 +520,21 @@ class MainWindow(QWidget):
         self._resize_left = pp[0]
         self._resize_bottom = pp[3]
         self._set_native_size_pinned(our[2] - our[0], our[3] - our[1])
+        self._stack_above_propresenter()
         return True
+
+    def _stack_above_propresenter(self) -> None:
+        hwnd = self._native_hwnd()
+        if not hwnd:
+            return
+        dummy = int(self._taskbar_owner.winId()) if self._taskbar_owner is not None else 0
+        if self.config.always_on_top and self.isVisible():
+            pp = propresenter_main_hwnd()
+            if pp:
+                stack_window_above(hwnd, pp)
+                return
+        if dummy:
+            set_window_owner(hwnd, dummy)
 
     def _restore_geometry(self) -> None:
         geo = self.config.geometry
@@ -1013,9 +997,9 @@ class MainWindow(QWidget):
             self._shown_for_workspace = True
             self.set_collapsed(False)
             self.show()
-            self.raise_()
             self._hide_from_taskbar()
             self._snap_to_propresenter()
+            self._stack_above_propresenter()
             self._sync_gui_enabled()
         elif not should_show and (self._shown_for_workspace or self.isVisible()):
             self._shown_for_workspace = False

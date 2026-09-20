@@ -104,8 +104,11 @@ class SettingsDialog(QDialog):
         decoder.setWordWrap(True)
         decoder.setObjectName("Hint")
 
-        self.always_on_top = QCheckBox("Always on top")
+        self.always_on_top = QCheckBox("Keep above ProPresenter")
         self.always_on_top.setChecked(config.always_on_top)
+        self.always_on_top.setToolTip(
+            "Stay in front of ProPresenter, but not in front of other apps you bring forward"
+        )
         self.start_windows = QCheckBox("Start with Windows")
         self.start_windows.setChecked(config.start_with_windows or startup_enabled())
         self.auto_show = QCheckBox("Show this pane when the workspace is open in ProPresenter")

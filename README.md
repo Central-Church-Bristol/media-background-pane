@@ -13,7 +13,7 @@ Built for [Central Church Bristol](https://github.com/Central-Church-Bristol).
 - DIM and Fade to Black close a camera-style vignette: edges darken first (colour stays the same), then from about 80% faded the whole frame eases to black
 - With DIM at black, FADE still takes preview to program without decoding (output stays black); PREVIEW and the thumbnail selection update so you can see the swap
 - Sends output as an NDI source named **Media Background Pane**
-- Can sit on top of ProPresenter, start with Windows, and show itself when a named workspace is open
+- Stays in front of ProPresenter without covering other apps you bring forward; can start with Windows and show itself when a named workspace is open
 - Can trigger ProPresenter’s first video input on startup
 - iPad remote on the local network: same library, MIX/DIM, FADE, and video input as the desktop pane
 
@@ -68,7 +68,7 @@ The iPad page is a remote control for the same session: thumbnails, preview/prog
 | Quality / fps | Match the ProPresenter NDI input; 540p 24fps is still the default |
 | Use GPU decode | D3D11VA via ffmpeg; falls back to software ffmpeg, then Qt |
 | Workspace name | Used to show the pane when that ProPresenter workspace is open |
-| Always on top / Start with Windows | Keep the pane available during service |
+| Keep above ProPresenter / Start with Windows | Sit in front of ProPresenter, without covering other apps you bring forward |
 | NDI name | Source name ProPresenter will see |
 | iPad URL | Open `http://…:8745` in Safari on the same Wi‑Fi (not https); Windows Firewall may prompt once |
 

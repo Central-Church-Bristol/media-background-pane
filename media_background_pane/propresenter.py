@@ -67,6 +67,8 @@ user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.GetWindowRect.restype = wintypes.BOOL
 user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user32.GetCursorPos.restype = wintypes.BOOL
 user32.SetWindowPos.argtypes = [
@@ -79,6 +81,12 @@ user32.SetWindowPos.argtypes = [
     ctypes.c_uint,
 ]
 user32.SetWindowPos.restype = wintypes.BOOL
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
 
 dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 dwmapi.DwmGetWindowAttribute.argtypes = [
@@ -91,9 +99,16 @@ dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
 
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TOPMOST = 0x00000008
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+GW_HWNDNEXT = 2
+GWLP_HWNDPARENT = -8
+HWND_NOTOPMOST = wintypes.HWND(-2)
 
 
 def _visible_window_rect(hwnd: int) -> wintypes.RECT | None:
@@ -175,15 +190,16 @@ def is_propresenter_running() -> bool:
     return bool(propresenter_pids())
 
 
-def propresenter_window_rect() -> tuple[int, int, int, int] | None:
+def propresenter_main_window() -> tuple[int, tuple[int, int, int, int]] | None:
     pids = set(propresenter_pids())
     if not pids:
         return None
-    best: tuple[int, int, int, int] | None = None
+    best_hwnd = 0
+    best_rect: tuple[int, int, int, int] | None = None
     best_area = 0
 
     def _enum(hwnd: int, _lparam: int) -> bool:
-        nonlocal best, best_area
+        nonlocal best_hwnd, best_rect, best_area
         if not user32.IsWindowVisible(hwnd):
             return True
         pid = wintypes.DWORD(0)
@@ -203,12 +219,78 @@ def propresenter_window_rect() -> tuple[int, int, int, int] | None:
         area = width * height
         if area > best_area:
             best_area = area
-            best = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+            best_hwnd = int(hwnd)
+            best_rect = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
         return True
 
     cb = WNDENUMPROC(_enum)
     user32.EnumWindows(cb, 0)
-    return best
+    if not best_hwnd or best_rect is None:
+        return None
+    return best_hwnd, best_rect
+
+
+def propresenter_window_rect() -> tuple[int, int, int, int] | None:
+    found = propresenter_main_window()
+    return found[1] if found else None
+
+
+def propresenter_main_hwnd() -> int | None:
+    found = propresenter_main_window()
+    return found[0] if found else None
+
+
+def window_owner(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    return int(user32.GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) or 0)
+
+
+def set_window_owner(hwnd: int, owner_hwnd: int) -> None:
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    if owner_hwnd and not user32.IsWindow(owner_hwnd):
+        return
+    if window_owner(hwnd) == int(owner_hwnd or 0):
+        return
+    user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner_hwnd or 0)
+    user32.SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+
+
+def apply_tool_window_style(hwnd: int) -> None:
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    WS_EX_APPWINDOW = 0x00040000
+    ex = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    new_ex = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+    if ex == new_ex:
+        return
+    user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex)
+    user32.SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+
+
+def stack_window_above(hwnd: int, below_hwnd: int) -> None:
+    if not hwnd or not below_hwnd or hwnd == below_hwnd:
+        return
+    if not user32.IsWindow(hwnd) or not user32.IsWindow(below_hwnd):
+        return
+    set_window_owner(hwnd, below_hwnd)
 
 
 _GENERIC_WORKSPACE_WORDS = {"service", "the", "a", "and", "workspace"}
