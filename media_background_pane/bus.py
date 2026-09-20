@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, QRectF, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
 
-from .config import GUI_FPS
+from .config import GUI_FPS, SCALE_ACTUAL, SCALE_FILL, SCALE_FIT, SCALE_MODES
 from .hw_decoder import HwDecoder, find_ffmpeg
 from .ndi_output import qimage_to_array
 
@@ -35,43 +35,55 @@ def black_frame(width: int, height: int) -> QImage:
     return image
 
 
-def fit_rgb(source: QImage, width: int, height: int) -> QImage:
+def place_rgb(source: QImage, width: int, height: int, mode: str = SCALE_FILL) -> QImage:
     if source.isNull():
         return black_frame(width, height)
-    if source.width() == width and source.height() == height:
-        if source.format() == QImage.Format.Format_RGB32:
-            return source
-        return source.convertToFormat(QImage.Format.Format_RGB32)
-    canvas = black_frame(width, height)
-    scaled = source.scaled(
-        width,
-        height,
-        Qt.AspectRatioMode.KeepAspectRatio,
-        Qt.TransformationMode.FastTransformation,
+    src = source
+    if src.format() != QImage.Format.Format_RGB32:
+        src = src.convertToFormat(QImage.Format.Format_RGB32)
+    if mode == SCALE_ACTUAL:
+        canvas = black_frame(width, height)
+        painter = QPainter(canvas)
+        painter.drawImage((width - src.width()) // 2, (height - src.height()) // 2, src)
+        painter.end()
+        return canvas
+    if src.width() == width and src.height() == height:
+        return src
+    aspect = (
+        Qt.AspectRatioMode.KeepAspectRatio
+        if mode == SCALE_FIT
+        else Qt.AspectRatioMode.KeepAspectRatioByExpanding
     )
+    scaled = src.scaled(width, height, aspect, Qt.TransformationMode.FastTransformation)
     if scaled.format() != QImage.Format.Format_RGB32:
         scaled = scaled.convertToFormat(QImage.Format.Format_RGB32)
+    if scaled.width() == width and scaled.height() == height:
+        return scaled
+    canvas = black_frame(width, height)
     painter = QPainter(canvas)
     painter.drawImage((width - scaled.width()) // 2, (height - scaled.height()) // 2, scaled)
     painter.end()
     return canvas
 
 
-def video_frame_to_rgb(frame: QVideoFrame, width: int, height: int) -> QImage:
+def fit_rgb(source: QImage, width: int, height: int) -> QImage:
+    return place_rgb(source, width, height, SCALE_FIT)
+
+
+def video_frame_to_rgb(frame: QVideoFrame) -> QImage:
     image = frame.toImage()
     if image.isNull():
-        canvas = black_frame(width, height)
         fw, fh = frame.width(), frame.height()
         if fw <= 0 or fh <= 0:
-            return canvas
-        scale = min(width / fw, height / fh)
-        dw = max(1, int(fw * scale))
-        dh = max(1, int(fh * scale))
+            return QImage()
+        canvas = black_frame(fw, fh)
         painter = QPainter(canvas)
-        frame.paint(painter, QRectF((width - dw) / 2, (height - dh) / 2, dw, dh))
+        frame.paint(painter, QRectF(0, 0, fw, fh))
         painter.end()
         return canvas
-    return fit_rgb(image, width, height)
+    if image.format() != QImage.Format.Format_RGB32:
+        return image.convertToFormat(QImage.Format.Format_RGB32)
+    return image
 
 
 def idle_decoder_status(use_gpu: bool) -> str:
@@ -110,6 +122,7 @@ class Bus(QObject):
         self._paused = False
         self._pause_after_first = False
         self._gpu_decode = True
+        self._scale_mode = SCALE_FILL
         self._apply_min_dt()
 
     @property
@@ -155,11 +168,7 @@ class Bus(QObject):
         self.frame = black_frame(self.process_w, self.process_h)
 
     def _publish_image(self, image: QImage) -> None:
-        fitted = image
-        if image.width() != self.process_w or image.height() != self.process_h:
-            fitted = fit_rgb(image, self.process_w, self.process_h)
-        elif fitted.format() != QImage.Format.Format_RGB32:
-            fitted = fitted.convertToFormat(QImage.Format.Format_RGB32)
+        fitted = place_rgb(image, self.process_w, self.process_h, self._scale_mode)
         with self._frame_lock:
             if self.frame_np.shape[0] != self.process_h or self.frame_np.shape[1] != self.process_w:
                 self._alloc_frame()
@@ -207,7 +216,7 @@ class Bus(QObject):
         with self._frame_lock:
             self._alloc_frame()
         if self._still and self.path and is_image(self.path):
-            self._publish_image(fit_rgb(QImage(str(self.path)), width, height))
+            self._publish_image(QImage(str(self.path)))
             self.frame_ready.emit()
         elif self._decoder is not None:
             self._decoder.restart(width, height)
@@ -219,6 +228,17 @@ class Bus(QObject):
         self._apply_min_dt()
         if self._decoder is not None:
             self._decoder.restart(fps=self._output_fps)
+
+    def set_scale_mode(self, mode: str) -> None:
+        next_mode = mode if mode in SCALE_MODES else SCALE_FILL
+        if self._scale_mode == next_mode:
+            return
+        self._scale_mode = next_mode
+        if self._still and self.path and is_image(self.path):
+            self._publish_image(QImage(str(self.path)))
+            self.frame_ready.emit()
+        elif self._decoder is not None:
+            self._decoder.restart(scale_mode=self._scale_mode)
 
     def set_full_frames(self, full: bool) -> None:
         if self._full_frames == full:
@@ -260,7 +280,7 @@ class Bus(QObject):
         self._convert_enabled = True
         self._last_convert = 0.0
         if is_image(path):
-            self._publish_image(fit_rgb(QImage(str(path)), self.process_w, self.process_h))
+            self._publish_image(QImage(str(path)))
             self._still = True
             self._set_decoder_status(idle_decoder_status(self._gpu_decode))
             self.frame_ready.emit()
@@ -292,6 +312,7 @@ class Bus(QObject):
             self._output_fps,
             self._gpu_decode,
             paused=False,
+            scale_mode=self._scale_mode,
         )
 
     def _on_player_error(self, error, message: str) -> None:
@@ -488,5 +509,5 @@ class Bus(QObject):
             return
         if not self._should_publish():
             return
-        self._publish_image(video_frame_to_rgb(video_frame, self.process_w, self.process_h))
+        self._publish_image(video_frame_to_rgb(video_frame))
         self._after_publish()

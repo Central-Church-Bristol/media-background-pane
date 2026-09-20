@@ -21,6 +21,15 @@ FPS_CHOICES = (24, 25, 30, 50, 60)
 GUI_WIDTH = 160
 GUI_HEIGHT = 90
 GUI_FPS = 5
+SCALE_FILL = "fill"
+SCALE_FIT = "fit"
+SCALE_ACTUAL = "actual"
+SCALE_MODES = (SCALE_FILL, SCALE_FIT, SCALE_ACTUAL)
+SCALE_MODE_LABELS = (
+    (SCALE_FILL, "Scale to Fill"),
+    (SCALE_FIT, "Scale to Fit"),
+    (SCALE_ACTUAL, "Actual Size"),
+)
 DEFAULTS_REVISION = 2
 
 
@@ -56,6 +65,7 @@ class Config:
         self.quality: str = "540p"
         self.use_gpu_decode: bool = True
         self.thumb_scale: int = 112
+        self.scale_mode: str = SCALE_FILL
         self.geometry: list[int] | None = None
         self.collapsed: bool = False
         self.defaults_revision: int = DEFAULTS_REVISION
@@ -86,6 +96,7 @@ class Config:
             "quality": self.quality,
             "use_gpu_decode": self.use_gpu_decode,
             "thumb_scale": self.thumb_scale,
+            "scale_mode": self.scale_mode,
             "geometry": self.geometry,
             "collapsed": self.collapsed,
             "remote_port": self.remote_port,
@@ -108,6 +119,8 @@ class Config:
             self.quality = "540p"
         self.use_gpu_decode = bool(self.use_gpu_decode)
         self.thumb_scale = max(64, min(200, int(self.thumb_scale or 112)))
+        if self.scale_mode not in SCALE_MODES:
+            self.scale_mode = SCALE_FILL
         try:
             self.remote_port = max(1024, min(65535, int(self.remote_port or 8745)))
         except (TypeError, ValueError):

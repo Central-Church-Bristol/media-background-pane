@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
@@ -18,6 +19,67 @@ def media_files(folder: Path, recursive: bool) -> list[Path]:
     files = [path for path in iterator if path.is_file() and is_media(path)]
     files.sort(key=lambda p: p.name.casefold())
     return files
+
+
+def unique_copy_path(folder: Path, name: str) -> Path:
+    dest = folder / name
+    if not dest.exists():
+        return dest
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    n = 2
+    while True:
+        candidate = folder / f"{stem} {n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def dropped_media_paths(paths: list[Path]) -> list[Path]:
+    found: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        candidates: list[Path] = []
+        if path.is_file():
+            candidates = [path]
+        elif path.is_dir():
+            try:
+                candidates = [child for child in path.iterdir() if child.is_file()]
+            except OSError:
+                candidates = []
+        for candidate in candidates:
+            if not is_media(candidate):
+                continue
+            try:
+                key = str(candidate.resolve())
+            except OSError:
+                key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+
+def copy_into_folder(sources: list[Path], folder: Path) -> tuple[list[Path], list[str]]:
+    copied: list[Path] = []
+    errors: list[str] = []
+    try:
+        dest_dir = folder.resolve()
+    except OSError:
+        return [], [folder.name]
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for src in sources:
+        try:
+            resolved = src.resolve()
+            if resolved.parent == dest_dir:
+                continue
+            dest = unique_copy_path(dest_dir, src.name)
+            shutil.copy2(resolved, dest)
+            copied.append(dest)
+        except OSError:
+            errors.append(src.name)
+    return copied, errors
 
 
 def thumb_cache_path(source: Path) -> Path:

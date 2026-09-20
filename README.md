@@ -6,9 +6,14 @@ Built for [Central Church Bristol](https://github.com/Central-Church-Bristol).
 
 ## What it does
 
-- Browses a media folder (images and video)
+- Browses a media folder (images and video). Drop files or folders onto the library to copy them in; names that already exist get a ` 2`, ` 3`, suffix
+- SIZE under the library scales the thumbnails. SCALE next to it is how media fills Preview, Program, and NDI:
+  - **Scale to Fill** (default) — covers the frame and crops overflow
+  - **Scale to Fit** — letterboxes so the whole image stays visible
+  - **Actual Size** — 1:1 pixels, centred; pads if smaller, crops if larger
 - Preview / program buses with MIX, DIM, a fade take, and Fade to Black
 - MIX and DIM don’t jump: a darker grey ghost handle follows the pointer, and the live handle eases toward it at the fade duration (same motion as FADE, Auto Fade, and Fade to Black)
+- Auto Fade is on each launch (not saved): clicking a clip loads Preview, then fades to Program
 - Fade duration cycles 1, 3, 5, 10, 20, and 30 seconds (starts at 10s each launch)
 - DIM and Fade to Black close a camera-style vignette: edges darken first (colour stays the same), then from about 80% faded the whole frame eases to black
 - With DIM at black, FADE still takes preview to program without decoding (output stays black); PREVIEW and the thumbnail selection update so you can see the swap
@@ -58,18 +63,19 @@ Chrome on iPad often upgrades the address to https and then shows `ERR_SSL_PROTO
 
 Use the same Wi‑Fi as the livestream PC. The first time the pane listens, Windows Firewall may ask to allow it — choose the **private** network.
 
-The iPad page is a remote control for the same session: thumbnails, preview/program, MIX and DIM, FADE, Fade to Black, Auto Fade, duration, and Video Input. Media folder, quality, and NDI name stay in the desktop Settings.
+The iPad page is a remote control for the same session: thumbnails, preview/program, MIX and DIM, FADE, Fade to Black, Auto Fade, duration, and Video Input. Media folder, quality, SCALE, and NDI name stay on the desktop pane.
 
 ## Settings worth knowing
 
 | Setting | Typical use |
 | --- | --- |
-| Media folder | Folder of backgrounds to browse |
+| Media folder | Folder of backgrounds to browse; drop files onto the library to copy them here |
 | Quality / fps | Match the ProPresenter NDI input; 540p 24fps is still the default |
 | Use GPU decode | D3D11VA via ffmpeg; falls back to software ffmpeg, then Qt |
 | Workspace name | Used to show the pane when that ProPresenter workspace is open |
 | Keep above ProPresenter / Start with Windows | Sit in front of ProPresenter, without covering other apps you bring forward |
 | NDI name | Source name ProPresenter will see |
+| SCALE (under the library) | Scale to Fill, Scale to Fit, or Actual Size; remembered between launches |
 | iPad URL | Open `http://…:8745` in Safari on the same Wi‑Fi (not https); Windows Firewall may prompt once |
 
 Settings are stored in `%LOCALAPPDATA%\Media Background Pane\settings.json`.

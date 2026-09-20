@@ -44,6 +44,10 @@ below in Safari as http:// (not https://). Chrome often
 upgrades to https and fails. Windows Firewall may ask to
 allow the pane on the private network — allow it.
 
+Drop files onto the library to copy them into the media
+folder. SCALE under the library is Scale to Fill (default),
+Scale to Fit, or Actual Size.
+
 If GPU decode is off or ffmpeg is missing, recoding files
 to 540p 24fps H.264 (around 2–4 Mbps) still helps a lot.
 """

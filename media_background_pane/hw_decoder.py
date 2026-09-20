@@ -14,6 +14,8 @@ from urllib.request import Request, urlopen
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
+from .config import SCALE_ACTUAL, SCALE_FILL, SCALE_MODES
+
 CREATE_NO_WINDOW = 0x08000000
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
@@ -236,20 +238,60 @@ def _fit_inside(src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, in
     return width, height
 
 
-def _vf_cpu(width: int, height: int, fps: int, flags: str) -> str:
-    return (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags={flags},"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"format=bgra,fps={max(1, fps)}"
-    )
+def _cover_size(src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, int]:
+    scale = max(out_w / max(1, src_w), out_h / max(1, src_h))
+    width = max(2, int(round(src_w * scale / 2.0)) * 2)
+    height = max(2, int(round(src_h * scale / 2.0)) * 2)
+    if width < out_w or height < out_h:
+        extra = max(out_w / max(1, width), out_h / max(1, height))
+        width = max(out_w, int(round(width * extra / 2.0)) * 2)
+        height = max(out_h, int(round(height * extra / 2.0)) * 2)
+    return width, height
 
 
-def _vf_d3d11(fit_w: int, fit_h: int, width: int, height: int, fps: int) -> str:
+def _crop_pad(width: int, height: int) -> str:
+    crop = "crop=min(iw\\," + str(width) + "):min(ih\\," + str(height) + ")"
+    return f"{crop},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+
+
+def _vf_cpu(width: int, height: int, fps: int, flags: str, mode: str) -> str:
+    if mode == SCALE_FILL:
+        scale = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase:flags={flags},"
+            f"crop={width}:{height},"
+        )
+    elif mode == SCALE_ACTUAL:
+        scale = _crop_pad(width, height) + ","
+    else:
+        scale = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags={flags},"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+        )
+    return f"{scale}format=bgra,fps={max(1, fps)}"
+
+
+def _vf_d3d11(
+    src_w: int,
+    src_h: int,
+    width: int,
+    height: int,
+    fps: int,
+    mode: str,
+) -> str:
+    tail = f"fps={max(1, fps)}"
+    if mode == SCALE_FILL:
+        cover_w, cover_h = _cover_size(src_w, src_h, width, height)
+        return (
+            f"scale_d3d11={cover_w}:{cover_h},"
+            f"hwdownload,format=bgra,{_crop_pad(width, height)},{tail}"
+        )
+    if mode == SCALE_ACTUAL:
+        return f"hwdownload,format=bgra,{_crop_pad(width, height)},{tail}"
+    fit_w, fit_h = _fit_inside(src_w, src_h, width, height)
     return (
         f"scale_d3d11={fit_w}:{fit_h},"
         f"hwdownload,format=bgra,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={max(1, fps)}"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,{tail}"
     )
 
 
@@ -266,6 +308,7 @@ class HwDecoder(QObject):
         self._height = 540
         self._fps = 24
         self._want_gpu = True
+        self._scale_mode = SCALE_FILL
         self._running = False
         self._paused = False
         self._unpause = threading.Event()
@@ -333,6 +376,7 @@ class HwDecoder(QObject):
         fps: int,
         gpu: bool,
         paused: bool = False,
+        scale_mode: str = SCALE_FILL,
     ) -> None:
         self.stop()
         self._path = path
@@ -340,6 +384,7 @@ class HwDecoder(QObject):
         self._height = max(2, height)
         self._fps = max(1, fps)
         self._want_gpu = gpu
+        self._scale_mode = scale_mode if scale_mode in SCALE_MODES else SCALE_FILL
         self._paused = paused
         self._queue = Queue(maxsize=2)
         if paused:
@@ -358,7 +403,13 @@ class HwDecoder(QObject):
         )
         self._thread.start()
 
-    def restart(self, width: int | None = None, height: int | None = None, fps: int | None = None) -> None:
+    def restart(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+        fps: int | None = None,
+        scale_mode: str | None = None,
+    ) -> None:
         if self._path is None:
             return
         self.start(
@@ -368,6 +419,7 @@ class HwDecoder(QObject):
             fps if fps is not None else self._fps,
             self._want_gpu,
             paused=self._paused,
+            scale_mode=scale_mode if scale_mode is not None else self._scale_mode,
         )
 
     def set_paused(self, paused: bool) -> None:
@@ -509,18 +561,18 @@ class HwDecoder(QObject):
             "-1",
         ]
         vf: Optional[str] = None
+        scale_mode = self._scale_mode
         if mode == "gpu-d3d11":
             probed = _probe_size(path)
             if probed is None:
                 return None
-            fit_w, fit_h = _fit_inside(probed[0], probed[1], self._width, self._height)
             cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
-            vf = _vf_d3d11(fit_w, fit_h, self._width, self._height, self._fps)
+            vf = _vf_d3d11(probed[0], probed[1], self._width, self._height, self._fps, scale_mode)
         elif mode == "gpu":
             cmd += ["-hwaccel", "d3d11va"]
-            vf = _vf_cpu(self._width, self._height, self._fps, "lanczos")
+            vf = _vf_cpu(self._width, self._height, self._fps, "lanczos", scale_mode)
         else:
-            vf = _vf_cpu(self._width, self._height, self._fps, "fast_bilinear")
+            vf = _vf_cpu(self._width, self._height, self._fps, "fast_bilinear", scale_mode)
         cmd += [
             "-i",
             str(path),

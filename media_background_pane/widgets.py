@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -24,6 +25,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .bus import is_media
+from .config import SCALE_FILL, SCALE_MODE_LABELS
+
 PP_BLUE = QColor("#0a84ff")
 PP_TRACK_OFF = QColor("#48484a")
 PP_KNOB = QColor("#ffffff")
@@ -37,6 +41,7 @@ class FlowLayout(QLayout):
 
     def addItem(self, item: QLayoutItem) -> None:
         self._items.append(item)
+        self.invalidate()
 
     def count(self) -> int:
         return len(self._items)
@@ -48,8 +53,16 @@ class FlowLayout(QLayout):
 
     def takeAt(self, index: int) -> QLayoutItem | None:
         if 0 <= index < len(self._items):
+            self.invalidate()
             return self._items.pop(index)
         return None
+
+    def set_widgets(self, widgets: list[QWidget]) -> None:
+        while self.count():
+            self.takeAt(0)
+        for widget in widgets:
+            self.addWidget(widget)
+        self.invalidate()
 
     def expandingDirections(self) -> Qt.Orientation:
         return Qt.Orientation(0)
@@ -83,9 +96,6 @@ class FlowLayout(QLayout):
         line_height = 0
         space = self.spacing()
         for item in self._items:
-            widget = item.widget()
-            if widget is not None and not widget.isVisible():
-                continue
             hint = item.sizeHint()
             next_x = x + hint.width() + space
             if next_x - space > effective.right() + 1 and line_height > 0:
@@ -306,12 +316,16 @@ class ThumbnailButton(QToolButton):
 class ThumbnailStrip(QWidget):
     chosen = Signal(str)
     scale_changed = Signal(int)
+    scale_mode_changed = Signal(str)
+    files_dropped = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("ThumbPanel")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAcceptDrops(True)
         self._buttons: dict[str, ThumbnailButton] = {}
+        self._file_keys: list[str] = []
         self._thumb_width = 112
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
@@ -328,13 +342,18 @@ class ThumbnailStrip(QWidget):
 
         self._inner = QWidget()
         self._layout = FlowLayout(self._inner, spacing=8)
-        self._placeholder = QLabel("Set a media folder in Settings")
+        self._placeholder = QLabel("Set a media folder in Settings, or drop files here")
         self._placeholder.setObjectName("Hint")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder.setWordWrap(True)
         self._layout.addWidget(self._placeholder)
         self._scroll.setWidget(self._inner)
         self._inner.setAutoFillBackground(False)
+        self._inner.setAcceptDrops(True)
+        self._scroll.setAcceptDrops(True)
+        self._scroll.viewport().setAcceptDrops(True)
         self._scroll.viewport().installEventFilter(self)
+        self._inner.installEventFilter(self)
 
         self._scale = QSlider(Qt.Orientation.Horizontal)
         self._scale.setObjectName("ThumbScale")
@@ -345,11 +364,26 @@ class ThumbnailStrip(QWidget):
         self._scale.valueChanged.connect(self._on_scale)
         scale_label = QLabel("SIZE")
         scale_label.setObjectName("SliderLabel")
+        self._scale_mode = QComboBox()
+        self._scale_mode.setObjectName("ScaleMode")
+        self._scale_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._scale_mode.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._scale_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        for value, label in SCALE_MODE_LABELS:
+            self._scale_mode.addItem(label, value)
+        index = self._scale_mode.findData(SCALE_FILL)
+        if index >= 0:
+            self._scale_mode.setCurrentIndex(index)
+        self._scale_mode.currentIndexChanged.connect(self._on_scale_mode)
+        mode_label = QLabel("SCALE")
+        mode_label.setObjectName("SliderLabel")
         self._scale_row = QHBoxLayout()
         self._scale_row.setContentsMargins(2, 0, 4, 2)
         self._scale_row.setSpacing(6)
         self._scale_row.addWidget(scale_label)
         self._scale_row.addWidget(self._scale, 0)
+        self._scale_row.addWidget(mode_label)
+        self._scale_row.addWidget(self._scale_mode, 0)
         self._scale_row.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -376,6 +410,21 @@ class ThumbnailStrip(QWidget):
         self._apply_scale(width)
         self.scale_changed.emit(width)
 
+    def set_scale_mode(self, mode: str) -> None:
+        index = self._scale_mode.findData(mode)
+        if index < 0:
+            index = self._scale_mode.findData(SCALE_FILL)
+        if index < 0:
+            return
+        self._scale_mode.blockSignals(True)
+        self._scale_mode.setCurrentIndex(index)
+        self._scale_mode.blockSignals(False)
+
+    def _on_scale_mode(self, _index: int) -> None:
+        mode = self._scale_mode.currentData()
+        if mode:
+            self.scale_mode_changed.emit(str(mode))
+
     def _apply_scale(self, width: int) -> None:
         self._thumb_width = width
         for button in self._buttons.values():
@@ -384,26 +433,53 @@ class ThumbnailStrip(QWidget):
         self._fit_flow()
 
     def set_files(self, paths: list[Path]) -> None:
-        wanted = {str(path) for path in paths}
-        for key, button in list(self._buttons.items()):
-            if key not in wanted:
-                self._group.removeButton(button)
-                self._layout.removeWidget(button)
-                button.deleteLater()
-                del self._buttons[key]
-        self._placeholder.setVisible(not paths)
-        existing = set(self._buttons)
-        for path in paths:
-            key = str(path)
-            if key in existing:
-                continue
-            button = ThumbnailButton(path, self._inner)
-            button.set_thumb_size(self._thumb_width)
-            button.chosen.connect(self.chosen.emit)
-            self._group.addButton(button)
-            self._buttons[key] = button
-            self._layout.addWidget(button)
-        self._fit_flow()
+        keys = [str(path) for path in paths]
+        wanted = set(keys)
+        if keys == self._file_keys and wanted == set(self._buttons):
+            return
+        self._inner.setUpdatesEnabled(False)
+        try:
+            for key, button in list(self._buttons.items()):
+                if key not in wanted:
+                    self._group.removeButton(button)
+                    self._layout.removeWidget(button)
+                    button.deleteLater()
+                    del self._buttons[key]
+            new_buttons: list[ThumbnailButton] = []
+            existing = set(self._buttons)
+            for path in paths:
+                key = str(path)
+                if key in existing:
+                    continue
+                button = ThumbnailButton(path, self._inner)
+                button.setVisible(False)
+                button.move(-10000, -10000)
+                button.set_thumb_size(self._thumb_width)
+                button.chosen.connect(self.chosen.emit)
+                self._group.addButton(button)
+                self._buttons[key] = button
+                new_buttons.append(button)
+            ordered: list[QWidget] = []
+            if not paths:
+                self._placeholder.setVisible(True)
+                ordered.append(self._placeholder)
+            else:
+                self._placeholder.setVisible(False)
+            for path in paths:
+                button = self._buttons.get(str(path))
+                if button is not None:
+                    ordered.append(button)
+            self._layout.set_widgets(ordered)
+            self._file_keys = keys
+            self._fit_flow()
+            for button in new_buttons:
+                button.setVisible(True)
+        finally:
+            self._inner.setUpdatesEnabled(True)
+            self._inner.update()
+
+    def set_empty_hint(self, text: str) -> None:
+        self._placeholder.setText(text)
 
     def set_thumb(self, path: str, image: QImage) -> None:
         button = self._buttons.get(path)
@@ -419,9 +495,75 @@ class ThumbnailStrip(QWidget):
         QTimer.singleShot(0, self._fit_flow)
 
     def eventFilter(self, watched, event) -> bool:
+        if event.type() in (
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.DragLeave,
+            QEvent.Type.Drop,
+        ) and watched in (self._scroll.viewport(), self._inner):
+            if event.type() == QEvent.Type.DragEnter:
+                self.dragEnterEvent(event)
+            elif event.type() == QEvent.Type.DragMove:
+                self.dragMoveEvent(event)
+            elif event.type() == QEvent.Type.DragLeave:
+                self.dragLeaveEvent(event)
+            else:
+                self.dropEvent(event)
+            return event.isAccepted()
         if watched is self._scroll.viewport() and event.type() == QEvent.Type.Resize:
             self._fit_flow()
         return super().eventFilter(watched, event)
+
+    def dragEnterEvent(self, event) -> None:
+        if self._drop_paths(event):
+            event.acceptProposedAction()
+            self._set_drop_ready(True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if self._drop_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._set_drop_ready(False)
+        event.accept()
+
+    def dropEvent(self, event) -> None:
+        self._set_drop_ready(False)
+        paths = self._drop_paths(event)
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.files_dropped.emit([str(path) for path in paths])
+
+    def _drop_paths(self, event) -> list[Path]:
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls():
+            return []
+        paths: list[Path] = []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_file() and is_media(path):
+                paths.append(path)
+            elif path.is_dir():
+                paths.append(path)
+        return paths
+
+    def _set_drop_ready(self, on: bool) -> None:
+        if bool(self.property("dropReady")) == on:
+            return
+        self.setProperty("dropReady", on)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self._scroll.style().unpolish(self._scroll)
+        self._scroll.style().polish(self._scroll)
+        self.update()
 
     def _fit_flow(self) -> None:
         width = max(1, self._scroll.viewport().width())
@@ -429,8 +571,10 @@ class ThumbnailStrip(QWidget):
             return
         height = max(1, self._layout.heightForWidth(width))
         self._inner.setMinimumHeight(0)
-        if self._inner.width() != width or self._inner.height() != height:
-            self._inner.resize(width, height)
+        self._inner.resize(width, height)
+        self._layout.activate()
+        self._layout.setGeometry(QRect(0, 0, width, height))
+        self._inner.update()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

@@ -8,7 +8,7 @@ from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QImage
 
 from .bus import Bus, idle_decoder_status
-from .config import GUI_FPS, GUI_HEIGHT, GUI_WIDTH, Config
+from .config import GUI_FPS, GUI_HEIGHT, GUI_WIDTH, SCALE_FILL, SCALE_MODES, Config
 from .hw_decoder import warmup_ffmpeg
 from .ndi_output import NdiSender
 from .timing import sleep_until
@@ -136,6 +136,8 @@ class Engine(QObject):
         self.program.set_process_size(width, height)
         self.preview.set_fps(config.fps)
         self.program.set_fps(config.fps)
+        self.preview.set_scale_mode(config.scale_mode)
+        self.program.set_scale_mode(config.scale_mode)
         self.mix = 0.0
         self.dimmer = 1.0
         self._pgm_np = np.zeros((height, width, 4), dtype=np.uint8)
@@ -268,6 +270,13 @@ class Engine(QObject):
         self.preview.set_gpu_decode(enabled)
         self.program.set_gpu_decode(enabled)
         self.decoder_status_changed.emit(self.decoder_status)
+
+    def set_scale_mode(self, mode: str) -> None:
+        next_mode = mode if mode in SCALE_MODES else SCALE_FILL
+        self.config.scale_mode = next_mode
+        self.preview.set_scale_mode(next_mode)
+        self.program.set_scale_mode(next_mode)
+        self._wake_compose()
 
     @Slot(float)
     def set_mix(self, value: float) -> None:

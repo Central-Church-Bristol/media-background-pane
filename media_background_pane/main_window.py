@@ -34,7 +34,14 @@ from PySide6.QtWidgets import (
 from .config import Config
 from .engine import Engine
 from .lan_server import LanHub, LanServer, lan_urls
-from .library import Thumbnailer, image_thumbnail, media_files, thumb_cache_path
+from .library import (
+    Thumbnailer,
+    copy_into_folder,
+    dropped_media_paths,
+    image_thumbnail,
+    media_files,
+    thumb_cache_path,
+)
 from .priority import prefer_livestream_apps
 from .propresenter import (
     PATH_SETTINGS,
@@ -172,6 +179,7 @@ class MainWindow(QWidget):
         self._animating = False
         self._shown_for_workspace = False
         self._files: list[Path] = []
+        self._ignore_folder_scan_until = 0.0
         self._resizing = False
         self._resize_left = 0
         self._resize_bottom = 0
@@ -236,7 +244,10 @@ class MainWindow(QWidget):
 
         self.thumbs.chosen.connect(self._on_thumb)
         self.thumbs.scale_changed.connect(self._on_thumb_scale)
+        self.thumbs.scale_mode_changed.connect(self._on_scale_mode)
+        self.thumbs.files_dropped.connect(self._import_dropped_files)
         self.thumbs.set_scale(self.config.thumb_scale)
+        self.thumbs.set_scale_mode(self.config.scale_mode)
         self.thumbs.set_footer_leading(self.settings_button)
         self.thumbnailer.ready.connect(self._on_thumb_ready)
         self.fade_button.clicked.connect(self._start_fade)
@@ -643,7 +654,7 @@ class MainWindow(QWidget):
             self._hide_from_taskbar()
             self._snap_to_propresenter()
 
-    def refresh_library(self) -> None:
+    def refresh_library(self, extra: list[Path] | None = None) -> None:
         folder = Path(self.config.media_folder) if self.config.media_folder else None
         paths: list[Path] = []
         watched = set(self._folder_watcher.directories())
@@ -653,6 +664,17 @@ class MainWindow(QWidget):
         if folder and folder.is_dir():
             paths = media_files(folder, self.config.include_subfolders)
             self._folder_watcher.addPath(str(folder))
+            self.thumbs.set_empty_hint("Drop images or videos here")
+        else:
+            self.thumbs.set_empty_hint("Set a media folder in Settings, or drop files here")
+        if extra:
+            known = {str(path) for path in paths}
+            for path in extra:
+                if str(path) in known or not path.is_file():
+                    continue
+                paths.append(path)
+                known.add(str(path))
+            paths.sort(key=lambda item: item.name.casefold())
         self._files = paths
         self.thumbs.set_files(paths)
         self._lan_files = [
@@ -673,6 +695,41 @@ class MainWindow(QWidget):
                 if not image.isNull():
                     self.thumbs.set_thumb(str(path), image)
 
+    def _import_dropped_files(self, paths: list[str]) -> None:
+        folder = Path(self.config.media_folder) if self.config.media_folder else None
+        if folder is None or not folder.is_dir():
+            QMessageBox.information(
+                self,
+                "Media folder",
+                "Set a media folder in Settings first, then drop files onto the library.",
+            )
+            self._open_settings()
+            return
+        sources = dropped_media_paths([Path(path) for path in paths])
+        if not sources:
+            QMessageBox.information(
+                self,
+                "Drop files",
+                "Drop images or videos the pane can play (jpg, png, mp4, mov, and similar).",
+            )
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            copied, errors = copy_into_folder(sources, folder)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._ignore_folder_scan_until = monotonic() + 1.0
+        self._scan_timer.stop()
+        self.refresh_library(extra=copied)
+        if errors:
+            names = ", ".join(errors[:8])
+            extra = "" if len(errors) <= 8 else f" and {len(errors) - 8} more"
+            QMessageBox.warning(
+                self,
+                "Couldn’t copy some files",
+                f"These files weren’t added: {names}{extra}",
+            )
+
     def _on_watched_path(self, path: str = "") -> None:
         if "PathSettings" in path or Path(path) == PATH_SETTINGS.parent:
             self._check_workspace()
@@ -681,6 +738,8 @@ class MainWindow(QWidget):
         self._schedule_scan()
 
     def _schedule_scan(self, _path: str = "") -> None:
+        if monotonic() < self._ignore_folder_scan_until:
+            return
         self._scan_timer.start()
 
     def _try_trigger_video_input(self) -> None:
@@ -742,6 +801,10 @@ class MainWindow(QWidget):
 
     def _on_thumb_scale(self, width: int) -> None:
         self.config.thumb_scale = width
+
+    def _on_scale_mode(self, mode: str) -> None:
+        self.engine.set_scale_mode(mode)
+        self.config.save()
 
     def _on_thumb(self, path: str) -> None:
         self.thumbs.set_selected(path)

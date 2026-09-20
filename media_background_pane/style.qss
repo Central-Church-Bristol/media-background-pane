@@ -43,6 +43,10 @@ QScrollArea#ThumbStrip {
     border: 1px solid #3a3a3c;
     border-radius: 4px;
 }
+QWidget#ThumbPanel[dropReady="true"] QScrollArea#ThumbStrip {
+    border: 1px solid #0a84ff;
+    background: #0b1a2c;
+}
 QScrollArea#ThumbStrip QWidget {
     background: transparent;
 }
@@ -325,6 +329,32 @@ QSlider#ThumbScale::handle:horizontal {
 QSlider#ThumbScale::handle:horizontal:hover {
     background: #ebebf0;
     border-color: #0a84ff;
+}
+
+QComboBox#ScaleMode {
+    background: #2c2c2e;
+    color: #ebebf0;
+    border: 1px solid #3a3a3c;
+    border-radius: 4px;
+    padding: 1px 18px 1px 6px;
+    min-height: 16px;
+    max-height: 20px;
+    font-size: 10px;
+}
+QComboBox#ScaleMode:hover, QComboBox#ScaleMode:focus {
+    border-color: #0a84ff;
+}
+QComboBox#ScaleMode::drop-down {
+    border: none;
+    width: 16px;
+}
+QComboBox#ScaleMode QAbstractItemView {
+    background: #2c2c2e;
+    color: #ebebf0;
+    border: 1px solid #3a3a3c;
+    selection-background-color: #3a3a3c;
+    selection-color: #ffffff;
+    outline: none;
 }
 
 QScrollBar:horizontal {
