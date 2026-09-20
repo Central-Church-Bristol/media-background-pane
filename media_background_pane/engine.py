@@ -8,7 +8,7 @@ from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QImage
 
 from .bus import Bus, idle_decoder_status
-from .config import GUI_HEIGHT, GUI_WIDTH, Config
+from .config import GUI_FPS, GUI_HEIGHT, GUI_WIDTH, Config
 from .hw_decoder import warmup_ffmpeg
 from .ndi_output import NdiSender
 from .timing import sleep_until
@@ -271,8 +271,10 @@ class Engine(QObject):
 
     @Slot(float)
     def set_mix(self, value: float) -> None:
+        was_mixing = self.mix > 0.001
         self.mix = min(1.0, max(0.0, value))
-        if not self._blacked_out():
+        mixing = self.mix > 0.001
+        if not self._blacked_out() and was_mixing != mixing:
             self._sync_preview_convert()
         self.mix_changed.emit(self.mix)
         self._wake_compose()
@@ -342,22 +344,32 @@ class Engine(QObject):
             if next_t < now - interval * 2:
                 next_t = now
 
+    def _emit_gui(self) -> bool:
+        if not self._gui_enabled:
+            return False
+        self._gui_n += 1
+        stride = max(1, int(round(self.config.fps / float(GUI_FPS))))
+        if self._gui_n < stride:
+            return False
+        self._gui_n = 0
+        return True
+
     def _compose_unlocked(self) -> None:
         if not self._compose_running or self._taking:
             return
-        gui = self._gui_enabled
         mix = self.mix
         dimmer = self.dimmer
+        emit_gui = self._emit_gui()
         if dimmer <= 0.001:
             self._sender.submit_array(self._black_np)
-            if gui:
+            if emit_gui:
                 self.program_changed.emit(self._gui_black())
             return
         wait = 0.008 if self.program.is_video else 0.0
         self.program.take_frame(self._pgm_np, timeout=wait)
         if mix <= 0.001 and dimmer >= 0.999:
             self._sender.submit_array(self._pgm_np)
-            if gui:
+            if emit_gui:
                 self.program_changed.emit(_scale_gui_array(self._pgm_np))
                 if self._preview_gui_dirty:
                     self._preview_gui_dirty = False
@@ -370,10 +382,9 @@ class Engine(QObject):
         else:
             mixed = _blend(self._pgm_np, self._pgm_np, 0.0, dimmer, self._vignette_r2)
         self._sender.submit_array(mixed)
-        if not gui:
-            return
-        self.program_changed.emit(_scale_gui_array(mixed))
-        self.preview_changed.emit(_scale_gui_array(self._pvw_np))
+        if emit_gui:
+            self.program_changed.emit(_scale_gui_array(mixed))
+            self.preview_changed.emit(_scale_gui_array(self._pvw_np))
 
     @Slot()
     def _on_program_frame(self) -> None:

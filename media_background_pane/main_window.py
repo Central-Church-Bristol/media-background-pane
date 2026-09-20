@@ -186,6 +186,7 @@ class MainWindow(QWidget):
         self._video_input_ignore_until = 0.0
         self._lan_server = None
         self._lan_hub = None
+        self._lan_files: list[dict] = []
 
         self.setObjectName("Root")
         self.setWindowTitle("Media Background Pane")
@@ -654,6 +655,14 @@ class MainWindow(QWidget):
             self._folder_watcher.addPath(str(folder))
         self._files = paths
         self.thumbs.set_files(paths)
+        self._lan_files = [
+            {
+                "path": str(path),
+                "name": path.name,
+                "thumb": f"/thumbs/{thumb_cache_path(path).name}",
+            }
+            for path in paths
+        ]
         self._sync_thumb_roles()
         for path in paths:
             image = self.thumbnailer.request(path)
@@ -1047,31 +1056,26 @@ class MainWindow(QWidget):
     def _snapshot_preview(self, image: QImage) -> None:
         if self._lan_server is None:
             return
+        if self.mix_slider.slider.is_dragging() or self.dim_slider.slider.is_dragging():
+            return
         self._lan_hub.set_jpeg("preview", _qimage_jpeg(image))
 
     def _snapshot_program(self, image: QImage) -> None:
         if self._lan_server is None:
+            return
+        if self.mix_slider.slider.is_dragging() or self.dim_slider.slider.is_dragging():
             return
         self._lan_hub.set_jpeg("program", _qimage_jpeg(image))
 
     def _publish_lan_state(self) -> None:
         if self._lan_server is None:
             return
-        files = []
-        for path in self._files:
-            files.append(
-                {
-                    "path": str(path),
-                    "name": path.name,
-                    "thumb": f"/thumbs/{thumb_cache_path(path).name}",
-                }
-            )
         preview = str(self.engine.preview.path) if self.engine.preview.path else ""
         program = str(self.engine.program.path) if self.engine.program.path else ""
         self._lan_hub.publish_state(
             {
-                "mix": self.mix_slider.slider.value() / 1000.0,
-                "dim": self.dim_slider.slider.value() / 1000.0,
+                "mix": self.mix_slider.visual() / 1000.0,
+                "dim": self.dim_slider.visual() / 1000.0,
                 "mix_target": self.mix_slider.ghost() / 1000.0,
                 "dim_target": self.dim_slider.ghost() / 1000.0,
                 "duration": self.config.fade_seconds,
@@ -1080,7 +1084,7 @@ class MainWindow(QWidget):
                 "preview": preview,
                 "program": program,
                 "fade_enabled": self.engine.preview.has_source,
-                "files": files,
+                "files": self._lan_files,
             }
         )
 

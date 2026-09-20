@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -518,8 +518,11 @@ class ChaseSlider(QSlider):
         self._show_ghost = False
         self._last_tick = 0.0
         self._timer = QTimer(self)
-        self._timer.setInterval(16)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(8)
         self._timer.timeout.connect(self._tick)
+        self._pos = float(self.value())
+        self._ghost = self.value()
 
     def set_fade_seconds(self, seconds: float) -> None:
         self._fade_seconds = max(0.05, float(seconds))
@@ -527,8 +530,14 @@ class ChaseSlider(QSlider):
     def is_chasing(self) -> bool:
         return self._chasing
 
+    def is_dragging(self) -> bool:
+        return self._dragging
+
     def ghost_value(self) -> int:
         return int(self._ghost)
+
+    def visual_value(self) -> float:
+        return float(self._pos)
 
     def setValue(self, value: int) -> None:
         super().setValue(value)
@@ -587,15 +596,21 @@ class ChaseSlider(QSlider):
             return
         self._dragging = True
         self.sliderPressed.emit()
-        self.set_target(self._value_from_pos(event.position()))
+        self._ghost = self._value_from_pos(event.position())
+        self._show_ghost = True
+        self._ensure_chase()
         self.grabMouse()
+        self.repaint()
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
         if not self._dragging:
             event.ignore()
             return
-        self.set_target(self._value_from_pos(event.position()))
+        self._ghost = self._value_from_pos(event.position())
+        self._show_ghost = True
+        self._ensure_chase()
+        self.repaint()
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
@@ -620,27 +635,65 @@ class ChaseSlider(QSlider):
         event.accept()
 
     def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        if not self._show_ghost or abs(self._ghost - self.value()) < 2:
-            return
-        opt = QStyleOptionSlider()
-        self.initStyleOption(opt)
-        opt.sliderPosition = self._ghost
-        opt.sliderValue = self._ghost
-        handle = self.style().subControlRect(
-            QStyle.ComplexControl.CC_Slider,
-            opt,
-            QStyle.SubControl.SC_SliderHandle,
-            self,
-        )
-        if handle.isEmpty():
-            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(QColor("#8e8e93"))
-        painter.setPen(QPen(QColor("#636366"), 1))
-        painter.drawEllipse(handle)
+        groove = self._groove_rect()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#3a3a3c"))
+        painter.drawRoundedRect(groove, 2, 2)
+        live = self._handle_center(self._pos)
+        painter.setBrush(QColor("#636366"))
+        if self.orientation() == Qt.Orientation.Horizontal:
+            fill = QRect(groove.x(), groove.y(), max(0, int(round(live.x() - groove.x()))), groove.height())
+        else:
+            fill = QRect(
+                groove.x(),
+                int(round(live.y())),
+                groove.width(),
+                max(0, groove.bottom() - int(round(live.y())) + 1),
+            )
+        painter.drawRoundedRect(fill, 2, 2)
+        if self._show_ghost and abs(self._ghost - self._pos) > 0.6:
+            self._draw_knob(painter, self._handle_center(float(self._ghost)), QColor("#8e8e93"))
+        self._draw_knob(painter, live, QColor("#ebebf0"))
         painter.end()
+
+    def _groove_rect(self) -> QRect:
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            opt,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+
+    def _handle_center(self, value: float) -> QPointF:
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            opt,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        radius = 7.0
+        mn = float(self.minimum())
+        mx = float(self.maximum())
+        t = 0.0 if mx <= mn else (value - mn) / (mx - mn)
+        t = max(0.0, min(1.0, t))
+        if opt.upsideDown:
+            t = 1.0 - t
+        if self.orientation() == Qt.Orientation.Horizontal:
+            x = groove.x() + radius + t * max(0.0, groove.width() - 2 * radius)
+            return QPointF(x, groove.center().y())
+        y = groove.y() + radius + t * max(0.0, groove.height() - 2 * radius)
+        return QPointF(groove.center().x(), y)
+
+    def _draw_knob(self, painter: QPainter, center: QPointF, color: QColor) -> None:
+        painter.setBrush(color)
+        painter.setPen(QPen(QColor("#636366"), 1))
+        painter.drawEllipse(QRectF(center.x() - 7, center.y() - 7, 14, 14))
 
     def _value_from_pos(self, pos) -> int:
         point = pos.toPoint() if hasattr(pos, "toPoint") else QPoint(int(pos.x()), int(pos.y()))
@@ -734,7 +787,10 @@ class ChaseSlider(QSlider):
         self._pos = max(float(self.minimum()), min(float(self.maximum()), self._pos))
         new_val = int(round(self._pos))
         if new_val != self.value():
+            blocked = self.blockSignals(True)
             super().setValue(new_val)
+            self.blockSignals(blocked)
+            self.valueChanged.emit(new_val)
         self.update()
 
 
@@ -791,3 +847,6 @@ class LabeledSlider(QWidget):
 
     def ghost(self) -> int:
         return self.slider.ghost_value()
+
+    def visual(self) -> float:
+        return self.slider.visual_value()
