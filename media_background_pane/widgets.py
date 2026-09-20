@@ -527,6 +527,9 @@ class ChaseSlider(QSlider):
     def is_chasing(self) -> bool:
         return self._chasing
 
+    def ghost_value(self) -> int:
+        return int(self._ghost)
+
     def setValue(self, value: int) -> None:
         super().setValue(value)
         if not self._chasing:
@@ -785,3 +788,6 @@ class LabeledSlider(QWidget):
 
     def snap_to(self, value: int) -> None:
         self.slider.snap_to(value)
+
+    def ghost(self) -> int:
+        return self.slider.ghost_value()

@@ -54,10 +54,12 @@ class Config:
         self.auto_show_on_workspace: bool = True
         self.ndi_name: str = APP_NAME
         self.quality: str = "540p"
+        self.use_gpu_decode: bool = True
         self.thumb_scale: int = 112
         self.geometry: list[int] | None = None
         self.collapsed: bool = False
         self.defaults_revision: int = DEFAULTS_REVISION
+        self.remote_port: int = 8745
 
     @property
     def process_size(self) -> tuple[int, int]:
@@ -82,9 +84,11 @@ class Config:
             "auto_show_on_workspace": self.auto_show_on_workspace,
             "ndi_name": self.ndi_name,
             "quality": self.quality,
+            "use_gpu_decode": self.use_gpu_decode,
             "thumb_scale": self.thumb_scale,
             "geometry": self.geometry,
             "collapsed": self.collapsed,
+            "remote_port": self.remote_port,
             "defaults_revision": DEFAULTS_REVISION,
         }
 
@@ -102,7 +106,12 @@ class Config:
             self.fps = 24
         if self.quality not in QUALITY_SIZES:
             self.quality = "540p"
+        self.use_gpu_decode = bool(self.use_gpu_decode)
         self.thumb_scale = max(64, min(200, int(self.thumb_scale or 112)))
+        try:
+            self.remote_port = max(1024, min(65535, int(self.remote_port or 8745)))
+        except (TypeError, ValueError):
+            self.remote_port = 8745
         self.defaults_revision = DEFAULTS_REVISION
 
     @classmethod

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from typing import Optional
 
 os.environ.setdefault("NDI_DISABLE_HARDWARE_ACCELERATION", "1")
@@ -94,9 +93,6 @@ class NdiSender:
             self._configure_frame()
             self.available = True
             self.status = f"NDI sending as {self.name} ({self.width}x{self.height})"
-            self._running = True
-            self._thread = threading.Thread(target=self._run, name="ndi-send", daemon=True)
-            self._thread.start()
         except OSError as exc:
             self.status = f"NDI error: {exc}"
 
@@ -130,48 +126,23 @@ class NdiSender:
     def submit(self, image: QImage) -> None:
         if not self.available:
             return
-        with self._lock:
-            qimage_to_array(image, self._staging)
-            self._dirty = True
+        qimage_to_array(image, self._staging)
+        self.submit_array(self._staging)
 
     def submit_array(self, array: np.ndarray) -> None:
-        if not self.available:
+        if not self.available or self._send is None or self._frame is None:
             return
         with self._lock:
             if array.shape[0] != self.height or array.shape[1] != self.width:
                 return
-            np.copyto(self._staging, array)
-            self._dirty = True
-
-    def _run(self) -> None:
-        next_t = time.perf_counter()
-        while self._running:
-            with self._lock:
-                if self._dirty:
-                    np.copyto(self._bufs[self._buf_i], self._staging)
-                    self._dirty = False
-                    send_i = self._buf_i
-                    self._buf_i = 1 - self._buf_i
-                else:
-                    send_i = 1 - self._buf_i
-                sendbuf = self._bufs[send_i]
-                fps = self.fps
-            if self._frame is not None and self._send is not None:
-                self._frame.data = sendbuf
-                ndi.send_send_video_async_v2(self._send, self._frame)
-            interval = 1.0 / max(1, fps)
-            next_t += interval
-            delay = next_t - time.perf_counter()
-            if delay > 0:
-                threading.Event().wait(delay)
-            else:
-                next_t = time.perf_counter()
+            np.copyto(self._bufs[self._buf_i], array)
+            sendbuf = self._bufs[self._buf_i]
+            self._buf_i = 1 - self._buf_i
+            self._frame.data = sendbuf
+            ndi.send_send_video_async_v2(self._send, self._frame)
 
     def close(self) -> None:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
         if self._send is not None:
             try:
                 ndi.send_send_video_async_v2(self._send, None)

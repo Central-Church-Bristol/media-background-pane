@@ -15,6 +15,7 @@ Built for [Central Church Bristol](https://github.com/Central-Church-Bristol).
 - Sends output as an NDI source named **Media Background Pane**
 - Can sit on top of ProPresenter, start with Windows, and show itself when a named workspace is open
 - Can trigger ProPresenter’s first video input on startup
+- iPad remote on the local network: same library, MIX/DIM, FADE, and video input as the desktop pane
 
 Supported files: `.jpg` `.jpeg` `.png` `.webp` `.bmp` `.tif` `.tiff` `.gif` `.mp4` `.mov` `.m4v` `.avi` `.mkv` `.webm` `.wmv`
 
@@ -25,9 +26,11 @@ Supported files: `.jpg` `.jpeg` `.png` `.webp` `.bmp` `.tif` `.tiff` `.gif` `.mp
 - [NDI Runtime](https://ndi.video/tools/)
 - ProPresenter on the same PC (for the video-input workflow)
 
+`run.bat` downloads **ffmpeg** into `vendor/ffmpeg/` on first launch. That is what does GPU video decode (D3D11VA). If ffmpeg is missing, the pane falls back to Qt software decode.
+
 ## Run
 
-Double-click `run.bat`. The first launch creates `.venv` and installs dependencies from `requirements.txt`.
+Double-click `run.bat`. The first launch creates `.venv`, installs dependencies from `requirements.txt`, and downloads ffmpeg if it is not already present.
 
 Or, after the venv exists:
 
@@ -41,20 +44,32 @@ Only one instance runs at a time.
 
 1. **Settings → Inputs → Video Inputs → +**
 2. Device: **Media Background Pane (NDI)**
-3. Choose **24 fps** and a mode that matches Quality in this app (960×540 for 540p, 640×360 for 360p)
+3. Choose **24 fps** and a mode that matches Quality in this app (960×540 for 540p, 1920×1080 for 1080p)
 4. Put that input on your background look
 5. **Settings → Network → Enable Network** so the pane can auto-trigger the first video input on startup
 
-Default quality is **540p / 24 fps**. Recoding source files to 540p 24fps H.264 (about 2–4 Mbps) keeps the livestream PC from decoding heavy 1080p media.
+Default quality is **540p / 24 fps**. GPU decode (D3D11VA via ffmpeg) is on by default so existing 1080p files can play without a heavy CPU decode. 720p and 1080p output are usable once that is working; match the ProPresenter NDI input to Quality. If GPU decode is off or ffmpeg is missing, recoding sources to 540p 24fps H.264 (about 2–4 Mbps) still helps a lot.
+
+## iPad (same Wi‑Fi)
+
+The Windows pane has to stay running — it still does NDI and decoding. On the iPad, open **Safari** to the **iPad URL** in Settings (also in the tray tooltip), typically `http://192.168.x.x:8745`. It must be **http://**, not https:// — there is no certificate.
+
+Chrome on iPad often upgrades the address to https and then shows `ERR_SSL_PROTOCOL_ERROR`. Use Safari, or in Chrome type the full `http://…` URL and turn off **Always use secure connections**.
+
+Use the same Wi‑Fi as the livestream PC. The first time the pane listens, Windows Firewall may ask to allow it — choose the **private** network.
+
+The iPad page is a remote control for the same session: thumbnails, preview/program, MIX and DIM, FADE, Fade to Black, Auto Fade, duration, and Video Input. Media folder, quality, and NDI name stay in the desktop Settings.
 
 ## Settings worth knowing
 
 | Setting | Typical use |
 | --- | --- |
 | Media folder | Folder of backgrounds to browse |
-| Quality / fps | Match the ProPresenter NDI input; 540p 24fps is the lightest practical default |
+| Quality / fps | Match the ProPresenter NDI input; 540p 24fps is still the default |
+| Use GPU decode | D3D11VA via ffmpeg; falls back to software ffmpeg, then Qt |
 | Workspace name | Used to show the pane when that ProPresenter workspace is open |
 | Always on top / Start with Windows | Keep the pane available during service |
 | NDI name | Source name ProPresenter will see |
+| iPad URL | Open `http://…:8745` in Safari on the same Wi‑Fi (not https); Windows Firewall may prompt once |
 
 Settings are stored in `%LOCALAPPDATA%\Media Background Pane\settings.json`.

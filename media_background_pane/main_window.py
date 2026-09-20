@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from queue import Empty
 from time import monotonic
 
 from PySide6.QtCore import (
+    QBuffer,
     QFileSystemWatcher,
+    QIODevice,
     QPoint,
     QPointF,
     QRect,
@@ -30,7 +33,8 @@ from PySide6.QtWidgets import (
 
 from .config import Config
 from .engine import Engine
-from .library import Thumbnailer, image_thumbnail, media_files
+from .lan_server import LanHub, LanServer, lan_urls
+from .library import Thumbnailer, image_thumbnail, media_files, thumb_cache_path
 from .priority import prefer_livestream_apps
 from .propresenter import (
     PATH_SETTINGS,
@@ -139,6 +143,17 @@ def make_video_input_icon(color: str = "#ebebf0") -> QIcon:
     return icon
 
 
+def _qimage_jpeg(image: QImage, quality: int = 70) -> bytes:
+    frame = image
+    if frame is None or frame.isNull():
+        frame = QImage(8, 8, QImage.Format.Format_RGB32)
+        frame.fill(QColor(0, 0, 0))
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    frame.save(buf, "JPG", quality)
+    return bytes(buf.data())
+
+
 class MainWindow(QWidget):
     def __init__(self, config: Config, startup_mode: bool = False) -> None:
         super().__init__()
@@ -165,6 +180,8 @@ class MainWindow(QWidget):
         self._dim_animating = False
         self._video_input_triggered = False
         self._video_input_ignore_until = 0.0
+        self._lan_server = None
+        self._lan_hub = None
 
         self.setObjectName("Root")
         self.setWindowTitle("Media Background Pane")
@@ -232,6 +249,8 @@ class MainWindow(QWidget):
 
         self.engine.preview_changed.connect(self.preview_monitor.set_image)
         self.engine.program_changed.connect(self.program_monitor.set_image)
+        self.engine.preview_changed.connect(self._snapshot_preview)
+        self.engine.program_changed.connect(self._snapshot_program)
         self.engine.taken.connect(self._on_taken)
 
         self.preview_monitor.setMaximumWidth(200)
@@ -317,6 +336,9 @@ class MainWindow(QWidget):
             self._folder_watcher.addPath(str(PATH_SETTINGS))
 
         self._build_tray()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._stop_lan_remote)
         self._restore_geometry()
         self.refresh_library()
         self._update_fade_enabled()
@@ -341,6 +363,7 @@ class MainWindow(QWidget):
         self._video_input_timer.start()
         QTimer.singleShot(400, self._sync_video_input_status)
         self._video_input_status_timer.start()
+        self._start_lan_remote()
 
     def _apply_window_flags(self) -> None:
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -613,7 +636,7 @@ class MainWindow(QWidget):
             self._expanded_geo = self.geometry()
         self._collapsed = collapsed
         self.config.collapsed = collapsed
-        self.engine.gui_enabled = not collapsed
+        self._sync_gui_enabled()
         self.collapse.set_collapsed(collapsed)
         self._content.setVisible(not collapsed)
         self._grip.setVisible(not collapsed)
@@ -944,7 +967,13 @@ class MainWindow(QWidget):
 
     def _open_settings(self) -> None:
         status, _ok = self.engine.ndi_status
-        dialog = SettingsDialog(self.config, status, self)
+        dialog = SettingsDialog(
+            self.config,
+            status,
+            self,
+            remote_url=self._lan_url_text(),
+            decoder_status=self.engine.decoder_status,
+        )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
         old_name = self.config.ndi_name
@@ -954,6 +983,7 @@ class MainWindow(QWidget):
         set_startup_enabled(self.config.start_with_windows)
         self.engine.set_fps(self.config.fps)
         self.engine.set_quality(self.config.quality)
+        self.engine.set_gpu_decode(self.config.use_gpu_decode)
         self._apply_window_flags()
         self.show()
         self._hide_from_taskbar()
@@ -981,18 +1011,159 @@ class MainWindow(QWidget):
         should_show = self._pane_should_be_visible()
         if should_show and not self._shown_for_workspace:
             self._shown_for_workspace = True
-            self.engine.gui_enabled = True
             self.set_collapsed(False)
             self.show()
             self.raise_()
             self._hide_from_taskbar()
             self._snap_to_propresenter()
+            self._sync_gui_enabled()
         elif not should_show and (self._shown_for_workspace or self.isVisible()):
             self._shown_for_workspace = False
-            self.engine.gui_enabled = False
             self.hide()
+            self._sync_gui_enabled()
+
+    def _sync_gui_enabled(self) -> None:
+        lan = self._lan_server is not None
+        self.engine.gui_enabled = lan or (self.isVisible() and not self._collapsed)
+
+    def _lan_url_text(self) -> str:
+        if self._lan_server is not None:
+            urls = self._lan_server.urls()
+        else:
+            urls = lan_urls(self.config.remote_port)
+        return urls[0] if urls else f"http://127.0.0.1:{self.config.remote_port}"
+
+    def _start_lan_remote(self) -> None:
+        self._lan_hub = LanHub()
+        self._lan_server = LanServer(self._lan_hub, self.config.remote_port)
+        url = self._lan_server.start()
+        if url is None:
+            self._lan_server = None
+            self.tray.setToolTip("Media Background Pane")
+            return
+        self._snapshot_preview(self.preview_monitor._image)
+        self._snapshot_program(self.program_monitor._image)
+        self._lan_timer = QTimer(self)
+        self._lan_timer.setInterval(50)
+        self._lan_timer.timeout.connect(self._pump_lan)
+        self._lan_timer.start()
+        self._sync_gui_enabled()
+        self._publish_lan_state()
+        urls = "\n".join(self._lan_server.urls())
+        self.tray.setToolTip(f"Media Background Pane\n{urls}")
+
+    def _stop_lan_remote(self) -> None:
+        timer = getattr(self, "_lan_timer", None)
+        if timer is not None:
+            timer.stop()
+        if self._lan_server is not None:
+            self._lan_server.stop()
+            self._lan_server = None
+
+    def _snapshot_preview(self, image: QImage) -> None:
+        if self._lan_server is None:
+            return
+        self._lan_hub.set_jpeg("preview", _qimage_jpeg(image))
+
+    def _snapshot_program(self, image: QImage) -> None:
+        if self._lan_server is None:
+            return
+        self._lan_hub.set_jpeg("program", _qimage_jpeg(image))
+
+    def _publish_lan_state(self) -> None:
+        if self._lan_server is None:
+            return
+        files = []
+        for path in self._files:
+            files.append(
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "thumb": f"/thumbs/{thumb_cache_path(path).name}",
+                }
+            )
+        preview = str(self.engine.preview.path) if self.engine.preview.path else ""
+        program = str(self.engine.program.path) if self.engine.program.path else ""
+        self._lan_hub.publish_state(
+            {
+                "mix": self.mix_slider.slider.value() / 1000.0,
+                "dim": self.dim_slider.slider.value() / 1000.0,
+                "mix_target": self.mix_slider.ghost() / 1000.0,
+                "dim_target": self.dim_slider.ghost() / 1000.0,
+                "duration": self.config.fade_seconds,
+                "auto_fade": self.auto_fade.isChecked(),
+                "video_input": self.video_input_button.isChecked(),
+                "preview": preview,
+                "program": program,
+                "fade_enabled": self.engine.preview.has_source,
+                "files": files,
+            }
+        )
+
+    def _pump_lan(self) -> None:
+        if self._lan_hub is None or self._lan_server is None:
+            return
+        mix_cmd = None
+        dim_cmd = None
+        others: list[dict] = []
+        while True:
+            try:
+                cmd = self._lan_hub.commands.get_nowait()
+            except Empty:
+                break
+            op = cmd.get("op")
+            if op == "mix_target":
+                mix_cmd = cmd
+            elif op == "dim_target":
+                dim_cmd = cmd
+            else:
+                others.append(cmd)
+        for cmd in others:
+            self._apply_lan_command(cmd)
+        if mix_cmd is not None:
+            self._apply_lan_command(mix_cmd)
+        if dim_cmd is not None:
+            self._apply_lan_command(dim_cmd)
+        self._publish_lan_state()
+
+    def _apply_lan_command(self, cmd: dict) -> None:
+        op = cmd.get("op")
+        if op == "preview":
+            path = cmd.get("path")
+            if path:
+                self._on_thumb(str(path))
+        elif op == "fade":
+            self._start_fade()
+        elif op == "take":
+            if self.engine.preview.has_source:
+                self.engine.take()
+        elif op == "mix_target":
+            try:
+                value = max(0.0, min(1.0, float(cmd.get("value", 0))))
+            except (TypeError, ValueError):
+                return
+            self._pending_auto_fade = False
+            self.mix_slider.set_target(int(round(value * 1000)))
+        elif op == "dim_target":
+            try:
+                value = max(0.0, min(1.0, float(cmd.get("value", 1))))
+            except (TypeError, ValueError):
+                return
+            self.dim_slider.set_target(int(round(value * 1000)))
+        elif op == "black":
+            self._start_black_fade()
+        elif op == "duration":
+            self._cycle_duration()
+        elif op == "auto_fade":
+            self.auto_fade.setChecked(bool(cmd.get("value")))
+        elif op == "video_input":
+            want = bool(cmd.get("value"))
+            if want != self.video_input_button.isChecked():
+                self.video_input_button.setChecked(want)
+                self._toggle_video_input()
 
     def closeEvent(self, event) -> None:
         self._persist_geometry()
+        self._stop_lan_remote()
         self.engine.close()
         event.accept()

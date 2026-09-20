@@ -29,22 +29,35 @@ HELP = """ProPresenter input (same PC):
 1. Settings → Inputs → Video Inputs → +
 2. Device: Media Background Pane (NDI)
 3. Pick 24 fps, and a mode that matches Quality
-   (960×540 for 540p, or 640×360 for 360p)
+   (960×540 for 540p, or 1920×1080 for 1080p)
 4. Put that input on your background look
 5. Settings → Network → Enable Network
    (the pane auto-triggers the first video input on startup)
 
-540p / 24fps is the default. The on-screen monitors stay tiny
-so they do not steal time from the livestream.
+540p / 24fps is the default. GPU decode (D3D11VA) plays
+1080p files without the pane doing a heavy CPU decode.
+The on-screen monitors stay tiny so they do not steal
+time from the livestream.
 
-Recoding the files themselves to 540p 24fps H.264 (around
-2–4 Mbps) helps more than anything else: the PC then decodes
-a small file instead of a 1080p one.
+iPad: on the same Wi-Fi as this PC, open the iPad URL shown
+below in Safari as http:// (not https://). Chrome often
+upgrades to https and fails. Windows Firewall may ask to
+allow the pane on the private network — allow it.
+
+If GPU decode is off or ffmpeg is missing, recoding files
+to 540p 24fps H.264 (around 2–4 Mbps) still helps a lot.
 """
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, config: Config, ndi_status: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        ndi_status: str,
+        parent: QWidget | None = None,
+        remote_url: str = "",
+        decoder_status: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
@@ -70,7 +83,7 @@ class SettingsDialog(QDialog):
 
         self.workspace = QLineEdit(config.workspace_name)
         self.quality = QComboBox()
-        self.quality.addItem("High — 1080p (heavier)", "1080p")
+        self.quality.addItem("High — 1080p", "1080p")
         self.quality.addItem("Balanced — 720p", "720p")
         self.quality.addItem("Performance — 540p (recommended)", "540p")
         self.quality.addItem("Lightest — 360p", "360p")
@@ -85,6 +98,12 @@ class SettingsDialog(QDialog):
             index = self.fps.findData(24)
         self.fps.setCurrentIndex(max(0, index))
 
+        self.use_gpu = QCheckBox("Use GPU decode (D3D11VA)")
+        self.use_gpu.setChecked(config.use_gpu_decode)
+        decoder = QLabel(decoder_status or "Unknown")
+        decoder.setWordWrap(True)
+        decoder.setObjectName("Hint")
+
         self.always_on_top = QCheckBox("Always on top")
         self.always_on_top.setChecked(config.always_on_top)
         self.start_windows = QCheckBox("Start with Windows")
@@ -96,11 +115,20 @@ class SettingsDialog(QDialog):
         status = QLabel(ndi_status)
         status.setWordWrap(True)
         status.setObjectName("Hint")
+        self.remote_url = QLabel(remote_url or "Unavailable")
+        self.remote_url.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.remote_url.setWordWrap(True)
+        remote_hint = QLabel(
+            "Type http:// (not https://). Safari is more reliable than Chrome. "
+            "Same Wi‑Fi as this PC. Allow the pane in Windows Firewall if asked."
+        )
+        remote_hint.setWordWrap(True)
+        remote_hint.setObjectName("Hint")
 
         help_box = QTextEdit()
         help_box.setReadOnly(True)
         help_box.setPlainText(HELP)
-        help_box.setFixedHeight(190)
+        help_box.setFixedHeight(210)
 
         form = QFormLayout()
         form.addRow("Media folder", folder_wrap)
@@ -108,8 +136,12 @@ class SettingsDialog(QDialog):
         form.addRow("Workspace name", self.workspace)
         form.addRow("Quality", self.quality)
         form.addRow("Output frame rate", self.fps)
+        form.addRow("", self.use_gpu)
+        form.addRow("Decoder", decoder)
         form.addRow("NDI name", self.ndi_name)
         form.addRow("NDI status", status)
+        form.addRow("iPad URL", self.remote_url)
+        form.addRow("", remote_hint)
         form.addRow(self.always_on_top)
         form.addRow(self.start_windows)
         form.addRow(self.auto_show)
@@ -146,6 +178,7 @@ class SettingsDialog(QDialog):
         config.workspace_name = self.workspace.text().strip() or "Evening Service"
         config.quality = str(self.quality.currentData() or "540p")
         config.fps = int(self.fps.currentData() or 24)
+        config.use_gpu_decode = self.use_gpu.isChecked()
         config.ndi_name = self.ndi_name.text().strip() or "Media Background Pane"
         config.always_on_top = self.always_on_top.isChecked()
         config.start_with_windows = self.start_windows.isChecked()

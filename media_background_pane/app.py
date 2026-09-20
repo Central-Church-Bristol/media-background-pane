@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 from .config import Config
 from .main_window import MainWindow, make_app_icon
 from .priority import prefer_livestream_apps
+from .timing import begin_precise_timer, end_precise_timer
 
 
 def _prepare_windows_shell() -> None:
@@ -33,6 +34,7 @@ def _prepare_windows_shell() -> None:
 def main() -> None:
     startup = "--startup" in sys.argv
     _prepare_windows_shell()
+    begin_precise_timer()
     prefer_livestream_apps()
     try:
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_CompressHighFrequencyEvents, True)
@@ -50,4 +52,7 @@ def main() -> None:
         )
     config = Config.load()
     window = MainWindow(config, startup_mode=startup)
-    sys.exit(app.exec())
+    try:
+        sys.exit(app.exec())
+    finally:
+        end_precise_timer()

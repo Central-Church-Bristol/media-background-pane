@@ -6,3 +6,5 @@ __pycache__/
 .vscode/
 thumbs/
 *.log
+vendor/ffmpeg/*
+!vendor/ffmpeg/.gitkeep

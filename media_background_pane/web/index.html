@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1c1c1e">
+  <title>Media Background Pane</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app">
+    <section class="library" aria-label="Library">
+      <div class="thumbs" id="thumbs"></div>
+    </section>
+    <section class="stage">
+      <div class="monitors">
+        <figure class="monitor preview">
+          <figcaption>PREVIEW</figcaption>
+          <img id="previewImg" alt="Preview">
+        </figure>
+        <figure class="monitor program">
+          <figcaption>PROGRAM</figcaption>
+          <img id="programImg" alt="Program">
+        </figure>
+      </div>
+      <div class="mix-row">
+        <span class="slider-label">MIX</span>
+        <div class="slider horizontal" id="mix" role="slider" aria-label="Mix" aria-valuemin="0" aria-valuemax="1000">
+          <div class="track"></div>
+          <div class="fill" id="mixFill"></div>
+          <div class="ghost" id="mixGhost"></div>
+          <div class="knob" id="mixKnob"></div>
+        </div>
+      </div>
+      <div class="controls">
+        <button type="button" class="btn video" id="videoInput">VIDEO<br>INPUT OFF</button>
+        <button type="button" class="btn switch" id="autoFade"><span>Auto Fade</span><i></i></button>
+        <button type="button" class="btn fade" id="fade" disabled>FADE</button>
+        <button type="button" class="btn duration" id="duration">10s</button>
+        <button type="button" class="btn black" id="black">FADE TO<br>BLACK</button>
+      </div>
+    </section>
+    <aside class="dim-col">
+      <span class="slider-label">DIM</span>
+      <div class="slider vertical" id="dim" role="slider" aria-label="Dim" aria-valuemin="0" aria-valuemax="1000">
+        <div class="track"></div>
+        <div class="fill" id="dimFill"></div>
+        <div class="ghost" id="dimGhost"></div>
+        <div class="knob" id="dimKnob"></div>
+      </div>
+    </aside>
+  </div>
+  <p class="status" id="status">Connecting…</p>
+  <script src="/app.js"></script>
+</body>
+</html>
