@@ -50,11 +50,14 @@ from .propresenter import (
     is_propresenter_running,
     native_cursor_pos,
     native_window_rect,
+    native_window_visible,
     propresenter_main_hwnd,
     propresenter_window_rect,
     set_visible_window_rect,
     set_window_owner,
+    show_window_no_activate,
     stack_window_above,
+    window_owner,
     trigger_first_video_input,
     video_input_layer_active,
     workspace_is_open,
@@ -370,10 +373,11 @@ class MainWindow(QWidget):
             QTimer.singleShot(500, self._open_settings)
 
         if self._pane_should_be_visible():
+            self._shown_for_workspace = True
             self.show()
             self._hide_from_taskbar()
             self._snap_to_propresenter()
-            self._shown_for_workspace = True
+            self._stack_above_propresenter()
             if self.config.collapsed:
                 QTimer.singleShot(0, lambda: self.set_collapsed(True))
         else:
@@ -535,16 +539,31 @@ class MainWindow(QWidget):
         self._stack_above_propresenter()
         return True
 
+    def _detach_hidden_owner(self) -> None:
+        hwnd = self._native_hwnd()
+        if not hwnd:
+            return
+        owner = window_owner(hwnd)
+        # Windows will not show a window whose owner is hidden.
+        if owner and not native_window_visible(owner):
+            set_window_owner(hwnd, 0)
+
+    def _pane_is_on_screen(self) -> bool:
+        return self.isVisible() and native_window_visible(self._native_hwnd())
+
     def _stack_above_propresenter(self) -> None:
         hwnd = self._native_hwnd()
         if not hwnd:
             return
         dummy = int(self._taskbar_owner.winId()) if self._taskbar_owner is not None else 0
-        if self.config.always_on_top and self.isVisible():
+        if self.config.always_on_top and self._shown_for_workspace:
             pp = propresenter_main_hwnd()
             if pp:
                 stack_window_above(hwnd, pp)
-                return
+            else:
+                self._detach_hidden_owner()
+            self._show_if_windows_hid_it()
+            return
         if dummy:
             set_window_owner(hwnd, dummy)
 
@@ -1062,19 +1081,33 @@ class MainWindow(QWidget):
             return workspace_is_open(self.config.workspace_name)
         return is_propresenter_running()
 
+    def _show_if_windows_hid_it(self) -> None:
+        hwnd = self._native_hwnd()
+        if not hwnd or native_window_visible(hwnd):
+            return
+        # Qt ignores show() while it still believes the window is visible.
+        if self.isVisible():
+            self.hide()
+        self.show()
+        show_window_no_activate(self._native_hwnd())
+
     def _check_workspace(self) -> None:
         prefer_livestream_apps()
         should_show = self._pane_should_be_visible()
-        if should_show and not self._shown_for_workspace:
+        if should_show and not self._pane_is_on_screen():
+            opening = not self._shown_for_workspace
             self._shown_for_workspace = True
-            self.set_collapsed(False)
-            self.show()
+            self._detach_hidden_owner()
+            if opening:
+                self.set_collapsed(False)
+            self._show_if_windows_hid_it()
             self._hide_from_taskbar()
             self._snap_to_propresenter()
             self._stack_above_propresenter()
             self._sync_gui_enabled()
         elif not should_show and (self._shown_for_workspace or self.isVisible()):
             self._shown_for_workspace = False
+            self._detach_hidden_owner()
             self.hide()
             self._sync_gui_enabled()
 

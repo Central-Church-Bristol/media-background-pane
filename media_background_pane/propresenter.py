@@ -85,6 +85,8 @@ user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetWindow.restype = wintypes.HWND
 user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindow.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
 user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
 user32.AttachThreadInput.restype = wintypes.BOOL
 
@@ -106,6 +108,7 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SW_SHOWNA = 8
 GW_HWNDNEXT = 2
 GWLP_HWNDPARENT = -8
 HWND_NOTOPMOST = wintypes.HWND(-2)
@@ -244,6 +247,15 @@ def window_owner(hwnd: int) -> int:
     if not hwnd:
         return 0
     return int(user32.GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) or 0)
+
+
+def native_window_visible(hwnd: int) -> bool:
+    return bool(hwnd and user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd))
+
+
+def show_window_no_activate(hwnd: int) -> None:
+    if hwnd and user32.IsWindow(hwnd):
+        user32.ShowWindow(hwnd, SW_SHOWNA)
 
 
 def set_window_owner(hwnd: int, owner_hwnd: int) -> None:
