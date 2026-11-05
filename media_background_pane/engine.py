@@ -161,10 +161,10 @@ class Engine(QObject):
         return image
 
     def _submit_opaque_black(self) -> None:
-        # Now, not on the next tick, and drop a composed frame that is not black.
-        with self._out_lock:
-            self._out_ready = False
-            self._sender.submit_array(self._mixer.black)
+        # Black goes out on the next tick, in place of any frame composed
+        # before DIM reached black. Sending it at once, between two ticks,
+        # left a gap of almost two frame times after it.
+        self._stage(self._mixer.black)
         if self._gui_enabled:
             self.program_changed.emit(self._gui_black())
 
