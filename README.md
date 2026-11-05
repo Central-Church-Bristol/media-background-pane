@@ -31,7 +31,7 @@ Supported files: `.jpg` `.jpeg` `.png` `.webp` `.bmp` `.tif` `.tiff` `.gif` `.mp
 - [NDI Runtime](https://ndi.video/tools/)
 - ProPresenter on the same PC (for the video-input workflow)
 
-`run.bat` downloads **ffmpeg** into `vendor/ffmpeg/` on first launch. That is what does GPU video decode (D3D11VA). If ffmpeg is missing, the pane falls back to Qt software decode.
+`run.bat` downloads **ffmpeg** into `vendor/ffmpeg/` on first launch. That is what does GPU video decode: NVDEC on an NVIDIA card, D3D11VA on others. If ffmpeg is missing, the pane falls back to Qt software decode. `requirements.txt` includes OpenCV (`opencv-python-headless`), which does the blending; without it the pane still works, more slowly.
 
 ## Run
 
@@ -53,7 +53,7 @@ Only one instance runs at a time.
 4. Put that input on your background look
 5. **Settings → Network → Enable Network** so the pane can auto-trigger the first video input on startup
 
-Default quality is **540p / 24 fps**. GPU decode (D3D11VA via ffmpeg) is on by default so existing 1080p files can play without a heavy CPU decode. 720p and 1080p output are usable once that is working; match the ProPresenter NDI input to Quality. If GPU decode is off or ffmpeg is missing, recoding sources to 540p 24fps H.264 (about 2–4 Mbps) still helps a lot.
+Default quality is **1080p / 24 fps** (since 5 Nov 2026; a saved 540p moves to 1080p once). Match the ProPresenter NDI input to Quality. GPU decode is on by default. Frames stay in the decoder's own format (NV12) from ffmpeg to NDI, so blending two 1080p clips takes well under one CPU core. `notes/perf-pipeline.md` has the measurements. If GPU decode is off or ffmpeg is missing, recoding sources to 540p 24fps H.264 (about 2–4 Mbps) still helps a lot.
 
 ## iPad (same Wi‑Fi)
 
@@ -70,14 +70,14 @@ The iPad page is a remote control for the same session: thumbnails, preview/prog
 | Setting | Typical use |
 | --- | --- |
 | Media folder | Folder of backgrounds to browse; drop files onto the library to copy them here |
-| Quality / fps | Match the ProPresenter NDI input; 540p 24fps is still the default |
-| Use GPU decode | D3D11VA via ffmpeg; falls back to software ffmpeg, then Qt |
+| Quality / fps | Match the ProPresenter NDI input; 1080p 24fps is the default |
+| Use GPU decode | NVDEC (NVIDIA) or D3D11VA via ffmpeg; falls back to software ffmpeg, then Qt |
 | Workspace name | Used to show the pane when that ProPresenter workspace is open (read from ProPresenter's own log) |
 | Keep above ProPresenter / Start with Windows | Sit in front of ProPresenter, without covering other apps you bring forward |
 | NDI name | Source name ProPresenter will see |
 | SCALE (under the library) | Scale to Fill, Scale to Fit, or Actual Size; remembered between launches |
 | iPad URL | Open `http://…:8745` in Safari on the same Wi‑Fi (not https); Windows Firewall may prompt once |
 
-Settings are stored in `%LOCALAPPDATA%\Media Background Pane\settings.json`. Errors go to `session.log` in that same folder, or to `Media Background Pane session.log` in `%TEMP%` if that folder cannot be written. If the compositor or a clip's decoder stops, the pane starts it again within about a second and writes a `watchdog:` line to that log. The log also says when and why the pane was shown or hidden, and when ProPresenter started or stopped.
+Settings are stored in `%LOCALAPPDATA%\Media Background Pane\settings.json`. Errors go to `session.log` in that same folder, or to `Media Background Pane session.log` in `%TEMP%` if that folder cannot be written. If the compositor or a clip's decoder stops, the pane starts it again within about a second and writes a `watchdog:` line to that log. The log also says when and why the pane was shown or hidden, and when ProPresenter started or stopped. Two lines point at stutter: `compose: no new frame ready in time` (at most once a minute) means a clip could not keep up, and `gui:` means the window's thread was blocked, which pauses MIX and DIM fades. An error that keeps repeating is written less and less often, with a count.
 
 If the pane disappears while ProPresenter is open, right-click the tray icon and choose **Show pane**. It comes back on top of ProPresenter and stays until ProPresenter closes or restarts.

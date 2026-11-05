@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import queue
+from ctypes import wintypes
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -201,6 +202,23 @@ def _qimage_jpeg(image: QImage, quality: int = 70) -> bytes:
     buf.open(QIODevice.OpenModeFlag.WriteOnly)
     frame.save(buf, "JPG", quality)
     return bytes(buf.data())
+
+
+_WM_GETMINMAXINFO = 0x0024
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _MINMAXINFO(ctypes.Structure):
+    _fields_ = [
+        ("ptReserved", _POINT),
+        ("ptMaxSize", _POINT),
+        ("ptMaxPosition", _POINT),
+        ("ptMinTrackSize", _POINT),
+        ("ptMaxTrackSize", _POINT),
+    ]
 
 
 def _pid_list(pids) -> str:
@@ -766,26 +784,14 @@ class MainWindow(QWidget):
         QTimer.singleShot(0, self.thumbs._fit_flow)
 
     def nativeEvent(self, eventType, message):
+        # Runs for every Windows message to the window, on the GUI thread. The
+        # two structures used to be defined here, on each call: about 50 us a
+        # message (5 Nov 2026). They are defined once now, below the class.
         try:
             if bytes(eventType) == b"windows_generic_MSG":
-                import ctypes
-                from ctypes import wintypes
-
-                class POINT(ctypes.Structure):
-                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-                class MINMAXINFO(ctypes.Structure):
-                    _fields_ = [
-                        ("ptReserved", POINT),
-                        ("ptMaxSize", POINT),
-                        ("ptMaxPosition", POINT),
-                        ("ptMinTrackSize", POINT),
-                        ("ptMaxTrackSize", POINT),
-                    ]
-
                 msg = wintypes.MSG.from_address(int(message))
-                if msg.message == 0x0024:
-                    info = MINMAXINFO.from_address(int(msg.lParam))
+                if msg.message == _WM_GETMINMAXINFO:
+                    info = _MINMAXINFO.from_address(int(msg.lParam))
                     min_w, min_h = self._native_min_size()
                     if self._collapsed:
                         min_w = max(
