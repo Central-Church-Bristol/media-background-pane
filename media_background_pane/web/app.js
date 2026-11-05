@@ -10,15 +10,37 @@ const videoBtn = document.getElementById("videoInput");
 const mixEl = document.getElementById("mix");
 const dimEl = document.getElementById("dim");
 
+// The MIX and DIM knobs are drawn where the PC says its knobs are. The PC
+// reports about ten times a second. Between reports, a moving knob carries on
+// the way the PC knob moves. When a report shows the knob is a little off, the
+// difference fades out instead of making the knob jump.
+const CARRY_LIMIT = 0.5; // seconds a report is carried forward, at most
+const STALE_AGE = 80; // ms: a report this old when sent means the PC was busy and its knob had stopped
+const PUMP_GAP = 0.05; // seconds the PC knob can move between two of its reports
+const SETTLE_TIME = 0.08; // seconds for a small difference to fade out
+const CATCH_UP_TIME = 0.03; // the same, when the knob is behind and only has to hurry on
+const SNAP_DISTANCE = 0.15; // a jump this big while the PC knob is still is a snap (after a take)
+const WAIT_LIMIT = 0.3; // seconds of travel a knob may be ahead and wait, instead of stepping back
+const GHOST_HOLD = 600; // ms the ghost stays where the finger left it, waiting for the PC
+
 let dragging = null;
 let localGhost = { mix: null, dim: null };
+let releasedAt = { mix: 0, dim: 0 };
 let lastPost = { mix: 0, dim: 0 };
 let lastFilesKey = "";
 let connected = false;
 let fadeSeconds = 10;
-let live = { mix: 0, dim: 1 };
+let reported = false;
+let asked = 0;
+let answered = 0;
+// The PC's last report for each knob, and when it was true, on this page's clock.
+let remote = {
+  mix: { value: 0, speed: 0, target: 0, at: 0, limit: 0 },
+  dim: { value: 1, speed: 0, target: 1, at: 0, limit: 0 },
+};
 let target = { mix: 0, dim: 1 };
 let display = { mix: 0, dim: 1 };
+let settle = { mix: 0, dim: 0 };
 let lastFrame = 0;
 
 function post(op, extra) {
@@ -124,6 +146,7 @@ function bindSlider(el, key, vertical) {
   const end = () => {
     if (dragging !== key) return;
     if (localGhost[key] != null) postTarget(key, localGhost[key], true);
+    releasedAt[key] = performance.now();
     dragging = null;
   };
   el.addEventListener("pointerdown", (event) => {
@@ -178,31 +201,96 @@ function renderThumbs(files, preview, program) {
   });
 }
 
-function applyState(state) {
+// How the PC knob moves (ChaseSlider._tick in widgets.py): it speeds up over
+// the first tenth of the fade time, keeps a steady speed, then slows down over
+// the last tenth and stops on its target. Carries a report forward by seconds.
+function carry(r, seconds) {
+  const fade = Math.max(0.05, fadeSeconds);
+  const ease = Math.max(0.06, 0.1 * fade);
+  const top = 1 / Math.max(fade - ease, 0.05);
+  const accel = top / ease;
+  let pos = r.value;
+  let vel = r.speed;
+  for (let left = seconds; left > 1e-6; left -= 0.008) {
+    const dt = Math.min(0.008, left);
+    const remaining = r.target - pos;
+    const dist = Math.abs(remaining);
+    if (dist < 0.0004 && Math.abs(vel) < top * 0.02) return r.target;
+    const dir = remaining > 0 ? 1 : -1;
+    if (vel * remaining < 0 || dist <= (vel * vel) / (2 * accel)) {
+      const dv = accel * dt;
+      vel = Math.abs(vel) <= dv ? 0 : vel - Math.sign(vel) * dv;
+    } else {
+      vel = Math.max(-top, Math.min(top, vel + dir * accel * dt));
+    }
+    pos += vel * dt;
+    if ((dir > 0 && pos >= r.target) || (dir < 0 && pos <= r.target)) return r.target;
+  }
+  return clamp01(pos);
+}
+
+// Where the PC knob should be at time now (ms, this page's clock).
+function predicted(key, now) {
+  const r = remote[key];
+  if (!r.speed && Math.abs(r.target - r.value) < 0.0005) return r.value;
+  return carry(r, Math.min(r.limit, Math.max(0, (now - r.at) / 1000)));
+}
+
+function takeReport(key, state, at, now) {
+  const value = Number(state[key]);
+  if (!Number.isFinite(value)) return;
+  const dest = Number(state[`${key}_target`]);
+  const r = remote[key];
+  // Where the knob would be drawn now from the last report.
+  const before = clamp01(predicted(key, now) + settle[key]);
+  r.value = clamp01(value);
+  r.speed = Number(state[`${key}_speed`]) || 0;
+  r.target = Number.isFinite(dest) ? clamp01(dest) : r.value;
+  r.at = at;
+  r.limit = Number(state.age_ms) > STALE_AGE ? PUMP_GAP : CARRY_LIMIT;
+  const guess = predicted(key, now);
+  if (!reported || (!r.speed && Math.abs(guess - before) > SNAP_DISTANCE)) {
+    // The first report, or the PC knob jumped (a take): follow at once.
+    settle[key] = 0;
+    display[key] = guess;
+  } else {
+    // Carry on from where the knob would have been; the difference fades out.
+    settle[key] = before - guess;
+  }
+}
+
+// The ghost shows where the knob is heading: the finger while dragging, then
+// the PC's own ghost once the PC has caught up with where the finger let go.
+function ghostTarget(key, now) {
+  const mine = localGhost[key];
+  if (mine != null) {
+    const waiting = Math.abs(remote[key].target - mine) > 0.002;
+    if (waiting && now - releasedAt[key] < GHOST_HOLD) return mine;
+    localGhost[key] = null;
+  }
+  return remote[key].target;
+}
+
+function applyState(state, sentAt, receivedAt) {
   connected = true;
   statusEl.classList.remove("err");
   statusEl.textContent = "";
   fadeSeconds = Number(state.duration) || 10;
-  live.mix = Number(state.mix) || 0;
-  live.dim = Number(state.dim) || 0;
-  if (dragging !== "mix") {
-    target.mix = Number(state.mix_target ?? live.mix);
-  }
-  if (dragging !== "dim") {
-    target.dim = Number(state.dim_target ?? live.dim);
-  }
-  if (Math.abs(live.mix - target.mix) < 0.02 && Math.abs(live.mix - display.mix) > 0.2) {
-    display.mix = live.mix;
-  }
-  if (Math.abs(live.dim - target.dim) < 0.02 && Math.abs(live.dim - display.dim) > 0.2) {
-    display.dim = live.dim;
-  }
+  // The PC says how old its report was when it answered; half the round trip
+  // covers the answer's way back.
+  const age = Math.max(0, Number(state.age_ms) || 0);
+  const at = receivedAt - Math.max(0, receivedAt - sentAt) / 2 - age;
+  takeReport("mix", state, at, receivedAt);
+  takeReport("dim", state, at, receivedAt);
+  reported = true;
+  if (dragging !== "mix") target.mix = ghostTarget("mix", receivedAt);
+  if (dragging !== "dim") target.dim = ghostTarget("dim", receivedAt);
   fadeBtn.disabled = !state.fade_enabled;
   durationBtn.textContent = `${state.duration}s`;
   autoFadeBtn.classList.toggle("on", !!state.auto_fade);
   videoBtn.classList.toggle("on", !!state.video_input);
   videoBtn.innerHTML = state.video_input ? "VIDEO<br>INPUT ON" : "VIDEO<br>INPUT OFF";
-  if (live.dim <= 0.001) {
+  if (remote.dim.value <= 0.001) {
     blackBtn.classList.add("from");
     blackBtn.innerHTML = "FADE FROM<br>BLACK";
   } else {
@@ -212,37 +300,53 @@ function applyState(state) {
   renderThumbs(state.files || [], state.preview || "", state.program || "");
 }
 
-function stepToward(pos, dest, dt) {
-  const fade = Math.max(0.05, fadeSeconds);
-  const maxV = 1 / fade;
-  const delta = dest - pos;
-  const mag = Math.abs(delta);
-  if (mag < 0.0008) return dest;
-  return pos + Math.sign(delta) * Math.min(mag, maxV * dt);
+// The next drawn position for one knob, dt seconds after the last frame.
+function follow(key, now, dt) {
+  const r = remote[key];
+  const way = Math.sign(r.speed || r.target - r.value);
+  const behind = settle[key] * way < 0;
+  const fade = Math.exp(-dt / (behind ? CATCH_UP_TIME : SETTLE_TIME));
+  settle[key] = Math.abs(settle[key]) < 0.0005 ? 0 : settle[key] * fade;
+  const pc = predicted(key, now);
+  const next = clamp01(pc + settle[key]);
+  const shown = display[key];
+  if (r.speed) {
+    // While the PC knob is on its way, a knob that is only slightly ahead of
+    // it waits instead of stepping back. Further ahead, it goes back.
+    const dir = Math.sign(r.speed);
+    const lead = (shown - pc) * dir;
+    const onTheWay = dir > 0 ? shown <= r.target : shown >= r.target;
+    const stepBack = (next - shown) * dir < 0;
+    if (stepBack && onTheWay && lead > 0 && lead < Math.abs(r.speed) * WAIT_LIMIT) {
+      settle[key] = shown - pc; // so the next report starts from where the knob is drawn
+      return shown;
+    }
+  }
+  return next;
 }
 
 function paintSliders(ts) {
   const dt = lastFrame ? Math.min(0.05, (ts - lastFrame) / 1000) : 0.016;
   lastFrame = ts;
-  display.mix = stepToward(display.mix, target.mix, dt);
-  display.dim = stepToward(display.dim, target.dim, dt);
-  if (dragging !== "mix" && Math.abs(target.mix - display.mix) < 0.02) {
-    display.mix += (live.mix - display.mix) * Math.min(1, dt * 8);
-  }
-  if (dragging !== "dim" && Math.abs(target.dim - display.dim) < 0.02) {
-    display.dim += (live.dim - display.dim) * Math.min(1, dt * 8);
-  }
+  display.mix = follow("mix", ts, dt);
+  display.dim = follow("dim", ts, dt);
   paintSlidersNow();
   requestAnimationFrame(paintSliders);
 }
 
 function pollState() {
+  const sentAt = performance.now();
+  const ask = ++asked;
   fetch("/api/state")
     .then((r) => {
       if (!r.ok) throw new Error("state");
       return r.json();
     })
-    .then(applyState)
+    .then((state) => {
+      if (ask < answered) return; // an older answer that arrived late
+      answered = ask;
+      applyState(state, sentAt, performance.now());
+    })
     .catch(() => {
       connected = false;
       statusEl.classList.add("err");

@@ -72,10 +72,12 @@ The iPad page is a remote control for the same session: thumbnails, preview/prog
 | Media folder | Folder of backgrounds to browse; drop files onto the library to copy them here |
 | Quality / fps | Match the ProPresenter NDI input; 540p 24fps is still the default |
 | Use GPU decode | D3D11VA via ffmpeg; falls back to software ffmpeg, then Qt |
-| Workspace name | Used to show the pane when that ProPresenter workspace is open |
+| Workspace name | Used to show the pane when that ProPresenter workspace is open (read from ProPresenter's own log) |
 | Keep above ProPresenter / Start with Windows | Sit in front of ProPresenter, without covering other apps you bring forward |
 | NDI name | Source name ProPresenter will see |
 | SCALE (under the library) | Scale to Fill, Scale to Fit, or Actual Size; remembered between launches |
 | iPad URL | Open `http://…:8745` in Safari on the same Wi‑Fi (not https); Windows Firewall may prompt once |
 
-Settings are stored in `%LOCALAPPDATA%\Media Background Pane\settings.json`.
+Settings are stored in `%LOCALAPPDATA%\Media Background Pane\settings.json`. Errors go to `session.log` in that same folder, or to `Media Background Pane session.log` in `%TEMP%` if that folder cannot be written. If the compositor or a clip's decoder stops, the pane starts it again within about a second and writes a `watchdog:` line to that log. The log also says when and why the pane was shown or hidden, and when ProPresenter started or stopped.
+
+If the pane disappears while ProPresenter is open, right-click the tray icon and choose **Show pane**. It comes back on top of ProPresenter and stays until ProPresenter closes or restarts.

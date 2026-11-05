@@ -42,25 +42,29 @@ from .library import (
     media_files,
     thumb_cache_path,
 )
+from .log import Throttle, log_event
 from .priority import prefer_livestream_apps
 from .propresenter import (
     PATH_SETTINGS,
     clear_video_input_layer,
     apply_tool_window_style,
-    is_propresenter_running,
     native_cursor_pos,
     native_window_rect,
     native_window_visible,
-    propresenter_main_hwnd,
+    open_workspace,
+    propresenter_main_window,
+    propresenter_pids,
     propresenter_window_rect,
+    restore_window_no_activate,
     set_visible_window_rect,
     set_window_owner,
     show_window_no_activate,
     stack_window_above,
+    window_is_cloaked,
+    window_is_minimized,
     window_owner,
     trigger_first_video_input,
     video_input_layer_active,
-    workspace_is_open,
 )
 from .settings_dialog import SettingsDialog
 from .startup import set_enabled as set_startup_enabled
@@ -75,7 +79,30 @@ from .widgets import (
 )
 
 
+_APP_ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+
+
+def app_icon_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "icon.png"
+
+
 def make_app_icon() -> QIcon:
+    image = QImage(str(app_icon_path()))
+    if image.isNull():
+        return _drawn_app_icon()
+    icon = QIcon()
+    for size in _APP_ICON_SIZES:
+        scaled = image.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        icon.addPixmap(QPixmap.fromImage(scaled))
+    return icon
+
+
+def _drawn_app_icon() -> QIcon:
     pix = QPixmap(64, 64)
     pix.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pix)
@@ -168,6 +195,10 @@ def _qimage_jpeg(image: QImage, quality: int = 70) -> bytes:
     return bytes(buf.data())
 
 
+def _pid_list(pids) -> str:
+    return ", ".join(f"P{pid}" for pid in pids)
+
+
 class MainWindow(QWidget):
     def __init__(self, config: Config, startup_mode: bool = False) -> None:
         super().__init__()
@@ -181,6 +212,16 @@ class MainWindow(QWidget):
         self._collapsed = False
         self._animating = False
         self._shown_for_workspace = False
+        # Tray "Show pane": keep the pane up whatever the workspace check says,
+        # until ProPresenter closes or restarts, or the check agrees.
+        self._shown_by_hand = False
+        self._pp_pids: tuple[int, ...] | None = None
+        self._last_decision: tuple | None = None
+        self._attached: tuple | None = None
+        self._window_state: tuple | None = None
+        # Session-log lines about the pane's window, which could otherwise
+        # repeat many times a second if something kept hiding it.
+        self._events = Throttle(10.0)
         self._files: list[Path] = []
         self._ignore_folder_scan_until = 0.0
         self._resizing = False
@@ -191,6 +232,7 @@ class MainWindow(QWidget):
         self._resize_cursor = (0, 0)
         self._pending_auto_fade = False
         self._pending_preview_path: str | None = None
+        self._fade_after_black = False
         self._mix_anim_mode: str | None = None
         self._dim_animating = False
         self._video_input_triggered = False
@@ -233,7 +275,10 @@ class MainWindow(QWidget):
         self._set_video_input_button(False)
         self.auto_fade = LabeledSwitch("Auto Fade")
         self.auto_fade.setChecked(True)
-        self.auto_fade.setToolTip("Clicking a clip sends it to Preview, then fades to Program")
+        self.auto_fade.setToolTip(
+            "Clicking a clip sends it to Preview, then fades to Program. "
+            "While DIM is black, Preview shows that clip until DIM comes up"
+        )
         self.duration_button = QPushButton(f"{self.config.fade_seconds}s")
         self.duration_button.setObjectName("DurationButton")
         self.settings_button = QPushButton()
@@ -372,7 +417,9 @@ class MainWindow(QWidget):
         if not self.config.media_folder:
             QTimer.singleShot(500, self._open_settings)
 
-        if self._pane_should_be_visible():
+        show, why = self._workspace_decision(self._read_propresenter())
+        self._last_decision = (show, why, False)
+        if show is True:
             self._shown_for_workspace = True
             self.show()
             self._hide_from_taskbar()
@@ -380,8 +427,10 @@ class MainWindow(QWidget):
             self._stack_above_propresenter()
             if self.config.collapsed:
                 QTimer.singleShot(0, lambda: self.set_collapsed(True))
+            log_event("pane", f"shown at start: {why}")
         else:
             self._shown_for_workspace = False
+            log_event("pane", f"not shown at start: {why}")
 
         QTimer.singleShot(700, self._try_trigger_video_input)
         self._video_input_timer.start()
@@ -556,16 +605,30 @@ class MainWindow(QWidget):
         if not hwnd:
             return
         dummy = int(self._taskbar_owner.winId()) if self._taskbar_owner is not None else 0
-        if self.config.always_on_top and self._shown_for_workspace:
-            pp = propresenter_main_hwnd()
-            if pp:
-                stack_window_above(hwnd, pp)
+        if self.config.always_on_top and (self._shown_for_workspace or self._shown_by_hand):
+            found = propresenter_main_window()
+            if found:
+                stack_window_above(hwnd, found[0])
             else:
                 self._detach_hidden_owner()
+            self._note_attached(found)
             self._show_if_windows_hid_it()
             return
         if dummy:
             set_window_owner(hwnd, dummy)
+
+    def _note_attached(self, found: tuple[int, tuple[int, int, int, int]] | None) -> None:
+        """Log which ProPresenter window the pane sits on, when that changes (runs ten times a second)."""
+        if found is None:
+            key: tuple = (0,)
+            message = "no ProPresenter window to stack above"
+        else:
+            pp, (left, top, right, bottom) = found
+            key = (pp, right - left, bottom - top)
+            message = f"stacked above ProPresenter window 0x{pp:X}, {right - left}x{bottom - top} at {left},{top}"
+        if key != self._attached:
+            self._attached = key
+            self._events.event("attach", "pane", message)
 
     def _restore_geometry(self) -> None:
         geo = self.config.geometry
@@ -615,23 +678,72 @@ class MainWindow(QWidget):
     def contextMenuEvent(self, event) -> None:
         self._menu().exec(event.globalPos())
 
-    def _menu(self) -> QMenu:
-        menu = QMenu(self)
+    def _menu_actions(self) -> list:
+        """The pane's right-click menu, as (label, action) pairs; None is a separator."""
         if self._collapsed:
-            menu.addAction("Expand", lambda: self.set_collapsed(False))
+            first = ("Expand", lambda: self.set_collapsed(False))
         else:
-            menu.addAction("Collapse", lambda: self.set_collapsed(True))
-        menu.addAction("Settings…", self._open_settings)
-        menu.addSeparator()
-        menu.addAction("Quit", QApplication.quit)
+            first = ("Collapse", lambda: self.set_collapsed(True))
+        return [first, ("Settings…", self._open_settings), None, ("Quit", QApplication.quit)]
+
+    def _tray_actions(self) -> list:
+        return [("Show pane", self.show_pane_on_top), None] + self._menu_actions()
+
+    @staticmethod
+    def _fill_menu(menu: QMenu, actions: list) -> QMenu:
+        menu.clear()
+        for item in actions:
+            if item is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(item[0], item[1])
         return menu
+
+    def _menu(self) -> QMenu:
+        return self._fill_menu(QMenu(self), self._menu_actions())
 
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip("Media Background Pane")
-        self.tray.setContextMenu(self._menu())
+        self._tray_menu = QMenu(self)
+        # Rebuilt each time it opens, so Expand/Collapse matches the pane.
+        self._tray_menu.aboutToShow.connect(lambda: self._fill_menu(self._tray_menu, self._tray_actions()))
+        self._fill_menu(self._tray_menu, self._tray_actions())
+        self.tray.setContextMenu(self._tray_menu)
         self.tray.activated.connect(self._on_tray)
         self.tray.show()
+
+    def show_pane_on_top(self) -> None:
+        """Tray "Show pane": bring the pane back above ProPresenter, whatever the workspace check says.
+
+        It stays up until ProPresenter closes or restarts, or the check agrees
+        the workspace is open, so the check does not hide it again a second later.
+        """
+        show, why = self._workspace_decision(self._pp_pids or ())
+        self._shown_by_hand = True
+        self._shown_for_workspace = True
+        self._detach_hidden_owner()
+        self.set_collapsed(False)
+        restore_window_no_activate(self._native_hwnd())
+        self._show_if_windows_hid_it()
+        self._bring_on_screen()
+        self._hide_from_taskbar()
+        self._snap_to_propresenter()
+        self._stack_above_propresenter()
+        self._sync_gui_enabled()
+        check = "it agrees" if show is True else "it says: " + why
+        log_event("pane", f"shown from the tray menu, whatever the workspace check says ({check})")
+
+    def _bring_on_screen(self) -> None:
+        """Move the pane back onto a screen if it is off all of them."""
+        frame = self.frameGeometry()
+        if any(screen.availableGeometry().intersects(frame) for screen in QGuiApplication.screens()):
+            return
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        x = screen.x() + max(0, (screen.width() - frame.width()) // 2)
+        y = screen.y() + max(0, screen.height() - frame.height() - 48)
+        log_event("pane", f"was off every screen at {frame.x()},{frame.y()}; moved to {x},{y}")
+        self.move(x, y)
 
     def _on_tray(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -762,6 +874,7 @@ class MainWindow(QWidget):
         self._scan_timer.start()
 
     def _try_trigger_video_input(self) -> None:
+        """Once per ProPresenter run: switch its first video input on (retried every 2 s)."""
         if self._video_input_triggered:
             self._video_input_timer.stop()
             return
@@ -770,11 +883,25 @@ class MainWindow(QWidget):
             self._video_input_triggered = True
             self._video_input_timer.stop()
             self._set_video_input_button(True)
+            log_event("video input", "already on in ProPresenter")
             return
         if trigger_first_video_input():
             self._video_input_triggered = True
             self._video_input_timer.stop()
             self._set_video_input_button(True)
+            log_event("video input", "switched ProPresenter's first video input on")
+
+    def _rearm_video_input(self) -> None:
+        """A new ProPresenter run: switch its video input on again, once, as at start-up.
+
+        Within a run, once it is on (or the operator has switched it off), it
+        is left alone.
+        """
+        self._video_input_triggered = False
+        self._video_input_ignore_until = 0.0
+        if not self._video_input_timer.isActive():
+            self._video_input_timer.start()
+        log_event("video input", "new ProPresenter run: will switch its first video input on")
 
     def _sync_video_input_status(self) -> None:
         if monotonic() < self._video_input_ignore_until:
@@ -808,13 +935,19 @@ class MainWindow(QWidget):
                 self._video_input_timer.stop()
                 self._video_input_ignore_until = monotonic() + max(1.5, duration + 0.3)
                 self._set_video_input_button(True)
+                log_event("video input", "switched on by the operator")
             else:
                 self._set_video_input_button(False)
         else:
+            # The operator's choice holds for this ProPresenter run: do not
+            # switch the input back on, even if the start-up attempt is still retrying.
+            self._video_input_triggered = True
+            self._video_input_timer.stop()
             ok = clear_video_input_layer(duration)
             if ok:
                 self._video_input_ignore_until = monotonic() + max(1.5, duration + 0.3)
                 self._set_video_input_button(False)
+                log_event("video input", "switched off by the operator")
             else:
                 self._set_video_input_button(True)
 
@@ -826,7 +959,18 @@ class MainWindow(QWidget):
         self.config.save()
 
     def _on_thumb(self, path: str) -> None:
+        self._fade_after_black = False
         self.thumbs.set_selected(path)
+        self._thumb_pick = path
+        if self.mix_slider.slider.value() <= 1:
+            thumb = self.thumbs.thumb_image(path)
+            if thumb is not None:
+                self.preview_monitor.set_image(thumb)
+        QTimer.singleShot(0, lambda picked=path: self._on_thumb_now(picked))
+
+    def _on_thumb_now(self, path: str) -> None:
+        if self._thumb_pick != path:
+            return
         try:
             self.engine.preview.frame_ready.disconnect(self._kick_auto_fade)
         except (RuntimeError, TypeError):
@@ -867,6 +1011,11 @@ class MainWindow(QWidget):
         if not self._pending_auto_fade:
             return
         self._pending_auto_fade = False
+        if self.engine.dimmer <= 0.001:
+            # A take here would swap the new clip off Preview before it can be seen.
+            # Commit it once DIM leaves black, so fade-up still reveals this clip.
+            self._fade_after_black = True
+            return
         self._start_fade()
 
     def _start_mix_down(self) -> None:
@@ -952,6 +1101,7 @@ class MainWindow(QWidget):
         except (RuntimeError, TypeError):
             pass
         self._pending_auto_fade = False
+        self._fade_after_black = False
         self._stop_mix_animation()
 
     def _on_mix_released(self) -> None:
@@ -982,14 +1132,26 @@ class MainWindow(QWidget):
 
     def _on_dim_changed(self, value: int) -> None:
         chasing = self.dim_slider.slider.is_chasing()
-        self.engine.set_dimmer(value / 1000.0, allow_pause=not chasing)
-        self._update_black_button()
+        self._apply_dim_value(value, allow_pause=not chasing)
 
     def _on_dim_chase_finished(self) -> None:
         self._dim_animating = False
-        amount = self.dim_slider.slider.value() / 1000.0
-        self.engine.set_dimmer(amount, allow_pause=True)
+        self._apply_dim_value(self.dim_slider.slider.value(), allow_pause=True)
+
+    def _apply_dim_value(self, value: int, allow_pause: bool) -> None:
+        if (
+            self._fade_after_black
+            and value > 1
+            and self.engine.dimmer <= 0.001
+            and self.engine.preview.has_source
+        ):
+            self._fade_after_black = False
+            self.engine.take()
+        was_black = self.engine.dimmer <= 0.001
+        self.engine.set_dimmer(value / 1000.0, allow_pause=allow_pause)
         self._update_black_button()
+        if was_black and self.engine.dimmer > 0.001:
+            self._sync_thumb_roles()
 
     def _fully_black(self) -> bool:
         return self.dim_slider.slider.value() <= 1
@@ -1008,6 +1170,7 @@ class MainWindow(QWidget):
         self.black_button.update()
 
     def _start_fade(self) -> None:
+        self._fade_after_black = False
         if not self.engine.preview.has_source:
             return
         self._stop_dim_animation()
@@ -1030,6 +1193,11 @@ class MainWindow(QWidget):
             pass
         self._pending_auto_fade = False
         self._stop_mix_animation()
+        if self._fade_after_black and self.engine.dimmer <= 0.001 and self.engine.preview.has_source:
+            self._fade_after_black = False
+            self.engine.take()
+        else:
+            self._fade_after_black = False
         current = float(self.engine.dimmer)
         target = 1.0 if current <= 0.001 else 0.0
         if abs(target - current) < 0.001:
@@ -1076,25 +1244,125 @@ class MainWindow(QWidget):
                 "Output resolution changed. If ProPresenter goes black, re-select the Media Background Pane input mode.",
             )
 
-    def _pane_should_be_visible(self) -> bool:
-        if self.config.auto_show_on_workspace:
-            return workspace_is_open(self.config.workspace_name)
-        return is_propresenter_running()
+    def _read_propresenter(self) -> tuple[int, ...]:
+        """The running ProPresenter process ids. Logs starts and stops.
+
+        A new run gets its video input switched on again, and ends a tray
+        "Show pane", as does ProPresenter closing.
+        """
+        pids = tuple(sorted(propresenter_pids()))
+        previous = self._pp_pids
+        self._pp_pids = pids
+        if previous is None:
+            log_event("propresenter", f"running: {_pid_list(pids)}" if pids else "not running")
+            return pids
+        if pids == previous:
+            return pids
+        stopped = [pid for pid in previous if pid not in pids]
+        started = [pid for pid in pids if pid not in previous]
+        if stopped:
+            self._events.event("propresenter stop", "propresenter", f"stopped: {_pid_list(stopped)}")
+        if started:
+            self._events.event("propresenter start", "propresenter", f"started: {_pid_list(started)}")
+        if self._shown_by_hand:
+            self._shown_by_hand = False
+            log_event("pane", "tray \"Show pane\" ends: ProPresenter closed or restarted")
+        if started:
+            self._rearm_video_input()
+        return pids
+
+    def _workspace_decision(self, pids: tuple[int, ...]) -> tuple[bool | None, str]:
+        """Whether the pane should be up, and why. None: not known yet, leave it as it is."""
+        if not self.config.auto_show_on_workspace:
+            if pids:
+                return True, f"ProPresenter is running ({_pid_list(pids)})"
+            return False, "ProPresenter is not running"
+        reading = open_workspace(list(pids))
+        if reading.source == "not running":
+            return False, reading.detail
+        if reading.source == "unknown":
+            return None, reading.detail
+        wanted = self.config.workspace_name
+        how = "from its log" if reading.source == "log" else "from PathSettings Base=, as the log had no answer"
+        if reading.is_named(wanted):
+            return True, f"{reading.detail} ({how})"
+        return False, f"{reading.detail}, not {wanted} ({how})"
+
+    def _note_decision(self, show: bool | None, why: str) -> None:
+        decision = (show, why, self._shown_by_hand)
+        if decision == self._last_decision:
+            return
+        self._last_decision = decision
+        verdict = {True: "show", False: "hide", None: "no change"}[show]
+        if show is False and self._shown_by_hand:
+            verdict = 'hide, but the tray "Show pane" keeps it up'
+        self._events.event("decision", "workspace check", f"{verdict}: {why}")
 
     def _show_if_windows_hid_it(self) -> None:
         hwnd = self._native_hwnd()
         if not hwnd or native_window_visible(hwnd):
             return
+        # Qt still believing the window is up means Windows hid it, not the pane.
+        windows_did_it = self.isVisible()
+        owner = window_owner(hwnd)
         # Qt ignores show() while it still believes the window is visible.
         if self.isVisible():
             self.hide()
         self.show()
         show_window_no_activate(self._native_hwnd())
+        if windows_did_it:
+            if owner:
+                whose = "visible" if native_window_visible(owner) else "hidden"
+                detail = f"its owner window 0x{owner:X} is {whose}"
+            else:
+                detail = "it has no owner window"
+            self._events.event("reshow", "pane", f"Windows had hidden the pane; showed it again ({detail})")
+
+    def _note_window_state(self) -> None:
+        """Log what the pane's own window looks like to Windows, when that changes.
+
+        If the pane vanishes without the workspace check hiding it, this says
+        how: hidden, minimised, cloaked (kept off screen by Windows), or moved.
+        """
+        hwnd = self._native_hwnd()
+        if not hwnd:
+            return
+        rect = native_window_rect(hwnd)
+        state = (
+            self.isVisible(),
+            native_window_visible(hwnd),
+            window_is_minimized(hwnd),
+            window_is_cloaked(hwnd),
+            rect,
+            window_owner(hwnd),
+        )
+        if state == self._window_state:
+            return
+        self._window_state = state
+        wanted, shown, minimised, cloaked, rect, owner = state
+        if not wanted:
+            look = "hidden by the pane"
+        elif minimised:
+            look = "minimised"
+        elif cloaked:
+            look = "cloaked: Windows keeps it off screen"
+        elif not shown:
+            look = "hidden by Windows"
+        else:
+            look = "on screen"
+        where = f"{rect[2] - rect[0]}x{rect[3] - rect[1]} at {rect[0]},{rect[1]}" if rect else "no position"
+        whose = f"owner 0x{owner:X}" if owner else "no owner"
+        self._events.event("window", "pane window", f"{look}; {where}; {whose}")
 
     def _check_workspace(self) -> None:
         prefer_livestream_apps()
-        should_show = self._pane_should_be_visible()
-        if should_show and not self._pane_is_on_screen():
+        pids = self._read_propresenter()
+        show, why = self._workspace_decision(pids)
+        if show is True and self._shown_by_hand:
+            self._shown_by_hand = False
+            log_event("pane", "tray \"Show pane\" ends: the workspace check agrees")
+        self._note_decision(show, why)
+        if show is True and not self._pane_is_on_screen():
             opening = not self._shown_for_workspace
             self._shown_for_workspace = True
             self._detach_hidden_owner()
@@ -1105,11 +1373,15 @@ class MainWindow(QWidget):
             self._snap_to_propresenter()
             self._stack_above_propresenter()
             self._sync_gui_enabled()
-        elif not should_show and (self._shown_for_workspace or self.isVisible()):
+            self._events.event("show", "pane", "shown" if opening else "put back on screen")
+        elif show is False and (self._shown_for_workspace or self.isVisible()) and not self._shown_by_hand:
             self._shown_for_workspace = False
             self._detach_hidden_owner()
             self.hide()
             self._sync_gui_enabled()
+            self._events.event("hide", "pane", "hidden")
+        self._note_window_state()
+        self._events.flush()
 
     def _sync_gui_enabled(self) -> None:
         lan = self._lan_server is not None
@@ -1174,6 +1446,10 @@ class MainWindow(QWidget):
                 "dim": self.dim_slider.visual() / 1000.0,
                 "mix_target": self.mix_slider.ghost() / 1000.0,
                 "dim_target": self.dim_slider.ghost() / 1000.0,
+                # How fast each knob is moving, so the iPad can keep its knob
+                # moving between reports instead of guessing.
+                "mix_speed": self.mix_slider.speed() / 1000.0,
+                "dim_speed": self.dim_slider.speed() / 1000.0,
                 "duration": self.config.fade_seconds,
                 "auto_fade": self.auto_fade.isChecked(),
                 "video_input": self.video_input_button.isChecked(),

@@ -6,6 +6,7 @@ import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -48,6 +49,7 @@ class LanHub:
         self.commands: queue.Queue[dict[str, Any]] = queue.Queue()
         self._lock = threading.Lock()
         self._state: dict[str, Any] = {}
+        self._published_at = 0.0
         self._preview_jpg = b""
         self._program_jpg = b""
 
@@ -57,10 +59,18 @@ class LanHub:
     def publish_state(self, state: dict[str, Any]) -> None:
         with self._lock:
             self._state = state
+            self._published_at = monotonic()
 
     def state(self) -> dict[str, Any]:
+        """The latest state, plus age_ms: how long ago the pane published it.
+
+        The iPad page uses the age to work out where a moving knob is by now.
+        """
         with self._lock:
-            return dict(self._state)
+            snapshot = dict(self._state)
+            if snapshot:
+                snapshot["age_ms"] = round((monotonic() - self._published_at) * 1000.0, 1)
+            return snapshot
 
     def set_jpeg(self, which: str, data: bytes) -> None:
         with self._lock:

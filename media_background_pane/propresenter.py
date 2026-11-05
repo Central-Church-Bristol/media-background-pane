@@ -3,8 +3,10 @@ from __future__ import annotations
 import ctypes
 import json
 import re
+import time
 from ctypes import wintypes
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PureWindowsPath
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -16,6 +18,9 @@ PATH_SETTINGS = (
     / "ProPresenter"
     / "PathSettings.proPaths"
 )
+# ProPresenter's own logs. Log.log is the run going on now; the nine before it
+# are kept as Log.1.log ... Log.9.log.
+PP_LOGS = Path.home() / "AppData" / "Local" / "RenewedVision" / "ProPresenter" / "Logs"
 NETWORK_PREFS = (
     Path.home()
     / "AppData"
@@ -89,6 +94,8 @@ user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.ShowWindow.restype = wintypes.BOOL
 user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
 user32.AttachThreadInput.restype = wintypes.BOOL
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
 
 dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 dwmapi.DwmGetWindowAttribute.argtypes = [
@@ -103,15 +110,20 @@ GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_TOPMOST = 0x00000008
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
+DWMWA_CLOAKED = 14
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SW_SHOWNOACTIVATE = 4
 SW_SHOWNA = 8
 GW_HWNDNEXT = 2
+GW_HWNDPREV = 3
 GWLP_HWNDPARENT = -8
+HWND_TOP = wintypes.HWND(0)
 HWND_NOTOPMOST = wintypes.HWND(-2)
+_Z_ORDER_WALK_LIMIT = 256
 
 
 def _visible_window_rect(hwnd: int) -> wintypes.RECT | None:
@@ -258,6 +270,26 @@ def show_window_no_activate(hwnd: int) -> None:
         user32.ShowWindow(hwnd, SW_SHOWNA)
 
 
+def window_is_minimized(hwnd: int) -> bool:
+    return bool(hwnd and user32.IsWindow(hwnd) and user32.IsIconic(hwnd))
+
+
+def window_is_cloaked(hwnd: int) -> bool:
+    """True when Windows keeps the window off screen though it counts as visible
+    (another virtual desktop, or hidden by the shell)."""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    cloaked = wintypes.DWORD(0)
+    status = dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+    return status == 0 and bool(cloaked.value)
+
+
+def restore_window_no_activate(hwnd: int) -> None:
+    """Un-minimise a window without taking the focus from ProPresenter."""
+    if window_is_minimized(hwnd):
+        user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+
+
 def set_window_owner(hwnd: int, owner_hwnd: int) -> None:
     if not hwnd or not user32.IsWindow(hwnd):
         return
@@ -297,59 +329,189 @@ def apply_tool_window_style(hwnd: int) -> None:
     )
 
 
+def _window_is_topmost(hwnd: int) -> bool:
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    return bool(int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) & WS_EX_TOPMOST)
+
+
+def window_is_above(hwnd: int, other: int) -> bool:
+    """True when hwnd is closer to the user than other."""
+    if not hwnd or not other or hwnd == other:
+        return False
+    current = int(other)
+    for _ in range(_Z_ORDER_WALK_LIMIT):
+        current = int(user32.GetWindow(current, GW_HWNDPREV) or 0)
+        if not current:
+            return False
+        if current == int(hwnd):
+            return True
+    return False
+
+
+def _place_window_above(hwnd: int, below_hwnd: int) -> None:
+    """Seat hwnd immediately above below_hwnd without activating it.
+
+    hWndInsertAfter is the window that stays in front. Passing the window
+    directly above ProPresenter lands the pane between that window and
+    ProPresenter. HWND_TOP is only the top of the normal band, so a topmost
+    audience output stays in front.
+    """
+    predecessor = int(user32.GetWindow(below_hwnd, GW_HWNDPREV) or 0)
+    if predecessor == int(hwnd):
+        return
+    insert_after = HWND_TOP if not predecessor or _window_is_topmost(predecessor) else predecessor
+    user32.SetWindowPos(
+        hwnd,
+        insert_after,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    )
+
+
 def stack_window_above(hwnd: int, below_hwnd: int) -> None:
     if not hwnd or not below_hwnd or hwnd == below_hwnd:
         return
     if not user32.IsWindow(hwnd) or not user32.IsWindow(below_hwnd):
         return
+    # Ownership alone does not move the pane. ProPresenter can already be
+    # fullscreen, and SWP_NOZORDER leaves that stack unchanged.
     set_window_owner(hwnd, below_hwnd)
+    if not window_is_above(hwnd, below_hwnd):
+        _place_window_above(hwnd, below_hwnd)
 
 
-_GENERIC_WORKSPACE_WORDS = {"service", "the", "a", "and", "workspace"}
+# Which workspace ProPresenter has open.
+#
+# A few seconds after it starts, each ProPresenter run logs exactly one line
+# naming the workspace it opened, tagged with its process id:
+#   04/11/2026 18:54:27 <tab> 0:00:04.389 <tab> P23256 T14 [R] <tab> INFO - Opened
+#   [C:\Users\...\LocalWorkspaces\Evening Service\Configuration\Workspace]
+# The default workspace opens ...\Documents\ProPresenter\Configuration\Workspace.
+# Switching workspace restarts ProPresenter, so the line holds for the whole run.
+# Every log from 31 Oct to 4 Nov 2026 has exactly one such line per run, about
+# 140 KB in. Nothing here asks ProPresenter over the network: this runs every
+# second on the GUI thread.
+_LOG_FILES = ("Log.log", "Log.1.log")
+_LOG_READ_LIMIT = 4_000_000
+_LOG_WAIT = 30.0  # seconds to wait for a new run's line before using Base=
+_LOG_OPENED = re.compile(r"\tP(\d+) T\d+ +\[R\]\tINFO - Opened \[([^\]\r\n]*\\Configuration\\Workspace)\]")
+_LOG_STARTED = re.compile(r"\tP(\d+) T\d+ +\[R\]\tINFO - Main Started")
 
 
-def _decode_workspace_blob(item: str) -> dict | None:
-    blob = item
-    if "\\u0022" in blob or "\u0022" in blob:
-        blob = blob.encode("utf-8", errors="ignore").decode("unicode_escape", errors="ignore")
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+@dataclass(frozen=True)
+class OpenWorkspace:
+    """Which workspace ProPresenter has open, and how that is known.
+
+    source is "log" (ProPresenter's own log line), "Base=" (the Base= line in
+    PathSettings.proPaths, used when the log has no answer), "unknown"
+    (ProPresenter is running but has not logged its workspace yet), or
+    "not running".
+    """
+
+    name: str | None
+    source: str
+    pid: int | None
+    detail: str
+
+    @property
+    def running(self) -> bool:
+        return self.source != "not running"
+
+    def is_named(self, wanted: str) -> bool:
+        return bool(self.name and wanted) and self.name.casefold() == wanted.casefold()
 
 
-def _path_settings_workspaces() -> list[dict]:
-    if not PATH_SETTINGS.is_file():
-        return []
-    try:
-        text = PATH_SETTINGS.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return []
-    workspaces: list[dict] = []
-    match = re.search(r"Workspaces=(.+?);", text, re.DOTALL)
-    if match:
+# Per ProPresenter run (process id). Dropped when the run ends.
+_log_workspaces: dict[int, tuple[str, str]] = {}  # pid -> (name, folder) from its log line
+_first_seen: dict[int, float] = {}  # pid -> when it was first seen running
+_no_log_line: dict[int, str] = {}  # pid -> why its log gave no answer, so Base= is used
+
+
+def open_workspace(pids: list[int] | None = None, *, clock=time.monotonic) -> OpenWorkspace:
+    """Which workspace the running ProPresenter has open, from its log."""
+    running = sorted(set(propresenter_pids() if pids is None else pids))
+    now = clock()
+    for pid in list(_first_seen):
+        if pid not in running:
+            _first_seen.pop(pid, None)
+            _log_workspaces.pop(pid, None)
+            _no_log_line.pop(pid, None)
+    if not running:
+        return OpenWorkspace(None, "not running", None, "ProPresenter is not running")
+    for pid in running:
+        _first_seen.setdefault(pid, now)
+    # Normally there is one. While one closes and the next starts, go by the newest.
+    pid = max(running, key=lambda p: (_first_seen[p], p))
+    found = _log_workspaces.get(pid)
+    if found is None and pid not in _no_log_line:
+        state, info = _read_log_workspace(pid)
+        if state == "opened":
+            folder = str(PureWindowsPath(info).parent.parent)
+            found = (PureWindowsPath(folder).name, folder)
+            _log_workspaces[pid] = found
+        elif state == "unreadable" or now - _first_seen[pid] >= _LOG_WAIT:
+            _no_log_line[pid] = info or f"no workspace line for P{pid} in its log after {_LOG_WAIT:.0f} s"
+        else:
+            return OpenWorkspace(None, "unknown", pid, f"ProPresenter P{pid} has not logged its workspace yet")
+    if found is not None:
+        name, folder = found
+        return OpenWorkspace(name, "log", pid, f"ProPresenter P{pid} opened {_workspace_label(name, folder)}")
+    why = _no_log_line.get(pid, "")
+    base = _base_workspace()
+    if base is None:
+        return OpenWorkspace(None, "unknown", pid, f"ProPresenter P{pid}: {why}, and no Base= line")
+    name, folder = base
+    return OpenWorkspace(name, "Base=", pid, f"ProPresenter P{pid}: {why}; Base= says {_workspace_label(name, folder)}")
+
+
+def workspace_is_open(workspace_name: str) -> bool:
+    return open_workspace().is_named(workspace_name)
+
+
+def _read_log_workspace(pid: int) -> tuple[str, str]:
+    """For one run: ("opened", path), ("starting", ""), ("absent", "") or ("unreadable", why)."""
+    started = False
+    problems: list[str] = []
+    found_a_log = False
+    for name in _LOG_FILES:
+        path = PP_LOGS / name
         try:
-            items = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            items = []
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, str):
-                    data = _decode_workspace_blob(item)
-                    if data:
-                        workspaces.append(data)
-    return workspaces
+            with path.open("rb") as handle:
+                raw = handle.read(_LOG_READ_LIMIT)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            problems.append(f"could not read {name} ({type(exc).__name__}: {exc})")
+            continue
+        found_a_log = True
+        text = _log_text(raw)
+        for match in _LOG_OPENED.finditer(text):
+            if int(match.group(1)) == pid:
+                return "opened", match.group(2)
+        if not started:
+            started = any(int(m.group(1)) == pid for m in _LOG_STARTED.finditer(text))
+    if started:
+        return "starting", ""
+    if problems:
+        return "unreadable", "; ".join(problems)
+    if not found_a_log:
+        return "unreadable", f"no ProPresenter log in {PP_LOGS}"
+    return "absent", ""
 
 
-def _path_settings_active_name() -> str | None:
-    for data in _path_settings_workspaces():
-        if data.get("Active") is True:
-            name = data.get("Name")
-            if name:
-                return str(name)
-    if not PATH_SETTINGS.is_file():
-        return None
+def _log_text(raw: bytes) -> str:
+    """ProPresenter's log as text. It starts with a byte-order mark and can hold NUL bytes."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.replace(b"\x00", b"").decode("utf-8", errors="replace")
+
+
+def _base_workspace() -> tuple[str, str] | None:
+    """The workspace folder on the Base= line of PathSettings.proPaths, as (name, folder)."""
     try:
         text = PATH_SETTINGS.read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -359,94 +521,15 @@ def _path_settings_active_name() -> str | None:
         if line.startswith("Base="):
             base = line[5:].rstrip(";").strip()
             if base:
-                return Path(base).name
+                folder = PureWindowsPath(base)
+                return folder.name, str(folder)
     return None
 
 
-def _json_names(data) -> list[str]:
-    names: list[str] = []
-    if isinstance(data, list):
-        for item in data:
-            names.extend(_json_names(item))
-    elif isinstance(data, dict):
-        ident = data.get("id")
-        if isinstance(ident, dict) and isinstance(ident.get("name"), str):
-            names.append(ident["name"])
-        if isinstance(data.get("name"), str):
-            names.append(data["name"])
-        for key in ("themes", "groups", "children", "items"):
-            if key in data:
-                names.extend(_json_names(data[key]))
-    return names
-
-
-def _live_content_names(base: str) -> list[str]:
-    names: list[str] = []
-    for path in ("/v1/media/playlists", "/v1/themes", "/v1/playlists"):
-        try:
-            status, body = _request(f"{base}{path}")
-        except (URLError, HTTPError, TimeoutError, OSError):
-            continue
-        if status != 200 or not body:
-            continue
-        try:
-            data = json.loads(body.decode("utf-8", errors="ignore"))
-        except json.JSONDecodeError:
-            continue
-        names.extend(_json_names(data))
-    return names
-
-
-def _workspace_tokens(name: str) -> set[str]:
-    return {
-        part
-        for part in name.casefold().replace("-", " ").split()
-        if part not in _GENERIC_WORKSPACE_WORDS and len(part) > 2
-    }
-
-
-def _score_workspace(name: str, live_names: list[str]) -> int:
-    tokens = _workspace_tokens(name)
-    if not tokens:
-        return 0
-    score = 0
-    needle = name.casefold()
-    for live in live_names:
-        lower = live.casefold()
-        if needle in lower:
-            score += 10
-            continue
-        padded = f" {lower} "
-        for token in tokens:
-            if padded.find(f" {token} ") >= 0 or lower.startswith(token + " ") or lower == token:
-                score += 1
-    return score
-
-
-def active_workspace_name() -> str | None:
-    configured = [str(item.get("Name")) for item in _path_settings_workspaces() if item.get("Name")]
-    base = find_api_base()
-    if base and configured:
-        live = _live_content_names(base)
-        best_name = None
-        best_score = 0
-        for name in configured:
-            score = _score_workspace(name, live)
-            if score > best_score:
-                best_score = score
-                best_name = name
-        if best_name and best_score > 0:
-            return best_name
-    return _path_settings_active_name()
-
-
-def workspace_is_open(workspace_name: str) -> bool:
-    if not workspace_name or not is_propresenter_running():
-        return False
-    active = active_workspace_name()
-    if not active:
-        return False
-    return active.casefold() == workspace_name.casefold()
+def _workspace_label(name: str, folder: str) -> str:
+    if PureWindowsPath(folder).parent.name.casefold() == "localworkspaces":
+        return f"workspace {name}"
+    return f"the default workspace ({name})"
 
 
 def _ports_to_try() -> list[int]:
@@ -481,9 +564,22 @@ def _video_input_duration(duration_seconds: float | None) -> float:
     return max(0.0, float(duration_seconds))
 
 
+# ProPresenter's API address, per run (process id). The Video Input button
+# asks ProPresenter for its status every second from the GUI thread; probing
+# every port each time made that several requests a second.
+_api_bases: dict[int, str] = {}
+
+
 def find_api_base() -> str | None:
-    if not is_propresenter_running():
+    pids = propresenter_pids()
+    for pid in list(_api_bases):
+        if pid not in pids:
+            del _api_bases[pid]
+    if not pids:
         return None
+    for pid in pids:
+        if pid in _api_bases:
+            return _api_bases[pid]
     for port in _ports_to_try():
         url = f"http://127.0.0.1:{port}/version"
         try:
@@ -499,8 +595,19 @@ def find_api_base() -> str | None:
         host = str(data.get("host_description", "")).lower()
         name = str(data.get("name", "")).lower()
         if "propresenter" in host or name:
-            return f"http://127.0.0.1:{port}"
+            base = f"http://127.0.0.1:{port}"
+            _api_bases[max(pids)] = base
+            return base
     return None
+
+
+def _forget_api_base(base: str, error: BaseException) -> None:
+    """A request to base could not connect: probe the ports again next time."""
+    if isinstance(error, HTTPError):
+        return  # it answered, so the address is right
+    for pid, known in list(_api_bases.items()):
+        if known == base:
+            del _api_bases[pid]
 
 
 def list_video_inputs(base: str | None = None) -> list[dict]:
@@ -509,7 +616,8 @@ def list_video_inputs(base: str | None = None) -> list[dict]:
         return []
     try:
         status, body = _request(f"{root}/v1/video_inputs")
-    except (URLError, HTTPError, TimeoutError, OSError):
+    except (URLError, HTTPError, TimeoutError, OSError) as exc:
+        _forget_api_base(root, exc)
         return []
     if status != 200 or not body:
         return []
@@ -568,7 +676,8 @@ def video_input_layer_active() -> bool | None:
         return None
     try:
         status, body = _request(f"{base}/v1/status/layers")
-    except (URLError, HTTPError, TimeoutError, OSError):
+    except (URLError, HTTPError, TimeoutError, OSError) as exc:
+        _forget_api_base(base, exc)
         return None
     if status != 200 or not body:
         return None

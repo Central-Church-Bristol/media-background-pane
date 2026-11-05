@@ -277,6 +277,7 @@ class ThumbnailButton(QToolButton):
         self.setToolTip(path.stem)
         self._pixmap = QPixmap(128, 72)
         self._pixmap.fill(QColor("#2c2c2e"))
+        self._has_thumb = False
         self.set_thumb_size(112)
         self.clicked.connect(lambda: self.chosen.emit(str(self.path)))
 
@@ -284,7 +285,14 @@ class ThumbnailButton(QToolButton):
         if image.isNull():
             return
         self._pixmap = QPixmap.fromImage(image)
+        self._has_thumb = True
         self._refresh_icon()
+
+    def thumb_image(self) -> QImage | None:
+        if not self._has_thumb or self._pixmap.isNull():
+            return None
+        image = self._pixmap.toImage()
+        return None if image.isNull() else image
 
     def set_thumb_size(self, width: int) -> None:
         height = max(40, round(width * 9 / 16))
@@ -486,6 +494,12 @@ class ThumbnailStrip(QWidget):
         if button is not None:
             button.set_image(image)
 
+    def thumb_image(self, path: str) -> QImage | None:
+        button = self._buttons.get(path)
+        if button is None:
+            return None
+        return button.thumb_image()
+
     def set_selected(self, path: str | None) -> None:
         for key, button in self._buttons.items():
             button.setChecked(key == path)
@@ -682,6 +696,10 @@ class ChaseSlider(QSlider):
 
     def visual_value(self) -> float:
         return float(self._pos)
+
+    def visual_speed(self) -> float:
+        """How fast the drawn knob is moving, in slider units a second (0 when it is still)."""
+        return float(self._vel) if self._chasing else 0.0
 
     def setValue(self, value: int) -> None:
         super().setValue(value)
@@ -994,3 +1012,6 @@ class LabeledSlider(QWidget):
 
     def visual(self) -> float:
         return self.slider.visual_value()
+
+    def speed(self) -> float:
+        return self.slider.visual_speed()

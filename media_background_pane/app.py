@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from .config import Config
+from .log import install_error_logging, log_event
 from .main_window import MainWindow, make_app_icon
 from .priority import prefer_livestream_apps
 from .timing import begin_precise_timer, end_precise_timer
@@ -33,6 +35,10 @@ def _prepare_windows_shell() -> None:
 
 def main() -> None:
     startup = "--startup" in sys.argv
+    install_error_logging()
+    # One line per start, so the log shows it works and when the pane started.
+    launched = " --startup" if startup else ""
+    log_event("start", f"pid {os.getpid()}, {Path(sys.executable).name}{launched}, Python {platform.python_version()}")
     _prepare_windows_shell()
     begin_precise_timer()
     prefer_livestream_apps()

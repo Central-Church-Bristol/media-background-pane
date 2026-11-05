@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from queue import Empty, Full, Queue
 from pathlib import Path
@@ -15,6 +16,8 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from .config import SCALE_ACTUAL, SCALE_FILL, SCALE_MODES
+from .log import log_exception
+from .timing import sleep_until
 
 CREATE_NO_WINDOW = 0x08000000
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
@@ -23,6 +26,9 @@ JobObjectExtendedLimitInformation = 9
 
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 _FIRST_FRAME_TIMEOUT = 3.0
+# A read that sits this long after frames have been flowing is a stuck ffmpeg
+# or a hung media file (Google Drive dropping out). Kill it and open the clip again.
+_STALL_TIMEOUT = 8.0
 _SIZE_RE = re.compile(r"Video:\s*.*?(\d{2,5})x(\d{2,5})")
 
 _ffmpeg_path: Optional[Path] = None
@@ -32,6 +38,14 @@ _job_handle = None
 
 def vendor_ffmpeg_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "vendor" / "ffmpeg"
+
+
+def _kill_proc(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def find_ffmpeg() -> Optional[Path]:
@@ -319,6 +333,16 @@ class HwDecoder(QObject):
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._generation = 0
+        # Frames read since the last start(). The engine's watchdog uses it.
+        self.frames_read = 0
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def thread_alive(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     def copy_frame(self, dest: np.ndarray) -> bool:
         with self._lock:
@@ -394,6 +418,7 @@ class HwDecoder(QObject):
         self._running = True
         self._generation += 1
         generation = self._generation
+        self.frames_read = 0
         self._set_status("starting")
         self._thread = threading.Thread(
             target=self._run,
@@ -430,7 +455,9 @@ class HwDecoder(QObject):
         else:
             self._unpause.set()
 
-    def stop(self) -> None:
+    def stop(self) -> threading.Thread | None:
+        # A GPU ffmpeg often takes about a second to die. Waiting here stalls
+        # the click that is trying to put the next clip on Preview.
         self._running = False
         self._paused = False
         self._unpause.set()
@@ -440,21 +467,17 @@ class HwDecoder(QObject):
         except Full:
             pass
         proc = self._proc
-        self._proc = None
         if proc is not None and proc.poll() is None:
             try:
                 proc.kill()
             except OSError:
                 pass
-            try:
-                proc.wait(timeout=1.5)
-            except subprocess.TimeoutExpired:
-                pass
         thread = self._thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
         self._thread = None
         self._set_status("stopped")
+        if thread is None or thread is threading.current_thread():
+            return None
+        return thread
 
     def _set_status(self, status: str) -> None:
         if self.status == status:
@@ -463,18 +486,46 @@ class HwDecoder(QObject):
         self.status_changed.emit(status)
 
     def _run(self, generation: int) -> None:
+        try:
+            while self._running and generation == self._generation:
+                try:
+                    if not self._run_attempts(generation):
+                        return
+                except Exception as exc:
+                    log_exception(f"decoder {self.name}", exc)
+                if not self._wait_retry(1.0):
+                    return
+        except BaseException as exc:
+            # Anything else ends this thread. Log it here; the engine's
+            # watchdog starts the clip again.
+            log_exception(f"decoder {self.name} thread", exc)
+
+    def _run_attempts(self, generation: int) -> bool:
+        """Try each decode mode once. True means keep trying while this clip is current."""
         attempts: list[str] = []
         if self._want_gpu:
             if _has_filter("scale_d3d11"):
                 attempts.append("gpu-d3d11")
             attempts.append("gpu")
         attempts.append("software")
+        produced = False
         for mode in attempts:
             if not self._running or generation != self._generation:
-                return
+                return False
             if self._play_mode(mode, generation):
-                return
-        self._set_status("Software fallback")
+                produced = True
+                break
+        if not self._running or generation != self._generation:
+            return False
+        if not produced:
+            self._set_status("Software fallback")
+        return True
+
+    def _wait_retry(self, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while self._running and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self._running
 
     def _play_mode(self, mode: str, generation: int) -> bool:
         ffmpeg = find_ffmpeg()
@@ -499,30 +550,57 @@ class HwDecoder(QObject):
         self._proc = proc
         frame_size = self._width * self._height * 4
         got_frame = threading.Event()
+        last_frame_at = [time.monotonic()]
+        # ffmpeg decodes as fast as it is read, so this loop sets the playback
+        # speed. The fps filter makes each frame 1/fps of a second of the clip,
+        # so read one frame every 1/fps second.
+        interval = 1.0 / max(1, self._fps)
+        next_due: Optional[float] = None
 
-        def _watchdog() -> None:
-            if not got_frame.wait(_FIRST_FRAME_TIMEOUT) and proc.poll() is None:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        def may_wait() -> bool:
+            return self._running and generation == self._generation and not self._paused
 
-        threading.Thread(target=_watchdog, name=f"ffmpeg-watch-{self.name}", daemon=True).start()
+        threading.Thread(
+            target=self._watch_playback,
+            name=f"ffmpeg-watch-{self.name}",
+            args=(proc, generation, got_frame, last_frame_at),
+            daemon=True,
+        ).start()
         try:
             while self._running and generation == self._generation:
                 while self._paused and self._running and generation == self._generation:
                     if not got_frame.is_set():
                         break
+                    last_frame_at[0] = time.monotonic()
+                    # Carry on from the paused frame at normal speed. Do not
+                    # rush through the time spent paused.
+                    next_due = None
                     self._unpause.wait(0.05)
                 if not self._running or generation != self._generation:
                     break
                 if self._paused and got_frame.is_set():
                     continue
+                if next_due is not None:
+                    sleep_until(next_due, may_wait)
+                    if not self._running or generation != self._generation:
+                        break
+                    if self._paused and got_frame.is_set():
+                        continue
                 data = self._read_exact(proc, frame_size)
                 if data is None:
                     break
                 if len(data) != frame_size:
                     break
+                last_frame_at[0] = time.monotonic()
+                if generation == self._generation:
+                    self.frames_read += 1
+                # The next frame is due one interval after this one. If ffmpeg is
+                # more than two frames late (slow loop restart, slow disk), start
+                # the clock again from now instead of rushing to catch up.
+                now = time.perf_counter()
+                if next_due is None or next_due < now - interval * 2:
+                    next_due = now
+                next_due += interval
                 frame = np.frombuffer(data, dtype=np.uint8).reshape(self._height, self._width, 4).copy()
                 frame[..., 3] = 255
                 with self._lock:
@@ -590,15 +668,40 @@ class HwDecoder(QObject):
         return cmd
 
     def _enqueue(self, frame: np.ndarray) -> bool:
+        # Drop the oldest frame instead of waiting. A blocked put fills the
+        # ffmpeg pipe and freezes the picture until the process is restarted.
+        # Playback speed is set by the reader in _play_mode, not by this queue.
         while self._running:
             if self._paused:
                 return True
             try:
-                self._queue.put(frame, timeout=0.05)
+                self._queue.put_nowait(frame)
                 return True
             except Full:
-                continue
+                try:
+                    self._queue.get_nowait()
+                except Empty:
+                    continue
         return False
+
+    def _watch_playback(
+        self,
+        proc: subprocess.Popen,
+        generation: int,
+        got_frame: threading.Event,
+        last_frame_at: list[float],
+    ) -> None:
+        if not got_frame.wait(_FIRST_FRAME_TIMEOUT) and proc.poll() is None:
+            _kill_proc(proc)
+            return
+        while proc.poll() is None and self._running and generation == self._generation:
+            time.sleep(0.25)
+            if self._paused:
+                last_frame_at[0] = time.monotonic()
+                continue
+            if time.monotonic() - last_frame_at[0] > _STALL_TIMEOUT:
+                _kill_proc(proc)
+                return
 
     def _read_exact(self, proc: subprocess.Popen, size: int) -> Optional[bytes]:
         stdout = proc.stdout

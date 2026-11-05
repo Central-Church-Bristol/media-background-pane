@@ -4,14 +4,30 @@ import threading
 import time
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QImage
 
 from .bus import Bus, idle_decoder_status
 from .config import GUI_FPS, GUI_HEIGHT, GUI_WIDTH, SCALE_FILL, SCALE_MODES, Config
 from .hw_decoder import warmup_ffmpeg
+from .log import log_event, log_exception, thread_stack
 from .ndi_output import NdiSender
 from .timing import sleep_until
+
+# The watchdog runs on the GUI thread, outside the threads it watches. On
+# 2 Nov 2026 the compose and Program decoder threads ended and nothing
+# replaced them, so NDI and the monitors stayed on one picture.
+_WATCH_INTERVAL_MS = 1000
+# A compose loop that has not ticked for this long is stuck, not slow. It
+# cannot be restarted while it is stuck, so the watchdog logs where it is.
+_COMPOSE_STUCK = 5.0
+# A clip that has been playing but has read no frame for this long is started
+# again. This is only a backstop: the decoder kills a silent ffmpeg after 8 s
+# and tries again, and opening a clip from Google Drive can take another 15 s.
+_DECODER_STUCK = 30.0
+# A longer gap between two checks means the PC was asleep or the GUI thread
+# was blocked. Times measured across it mean nothing, so measure again.
+_CHECK_GAP = 5.0
 
 
 def _scale_gui(image: QImage) -> QImage:
@@ -117,6 +133,7 @@ def _blend(
 
 class Engine(QObject):
     preview_changed = Signal(QImage)
+    preview_frame = Signal(QImage, int)
     program_changed = Signal(QImage)
     mix_changed = Signal(float)
     dimmer_changed = Signal(float)
@@ -150,15 +167,29 @@ class Engine(QObject):
         self._taking = False
         self._gui_n = 0
         self._preview_gui_dirty = False
+        self._shown_preview_serial = 0
+        self.preview_frame.connect(self._present_preview)
         self._compose_lock = threading.Lock()
+        self._compose_thread_lock = threading.Lock()
         self._compose_event = threading.Event()
         self._compose_running = True
+        self._compose_thread: threading.Thread | None = None
+        # Counted by the compose loop, watched by the watchdog.
+        self._compose_ticks = 0
+        self._watched_ticks = -1
+        self._watched_ticks_since = 0.0
+        self._compose_stuck_reported = False
+        self._last_check: float | None = None
         self.program.frame_ready.connect(self._on_program_frame)
         self.preview.frame_ready.connect(self._on_preview_frame)
         self.program.decoder_status_changed.connect(self._on_decoder_status)
         self.preview.decoder_status_changed.connect(self._on_decoder_status)
-        self._compose_thread = threading.Thread(target=self._compose_run, name="compose", daemon=True)
-        self._compose_thread.start()
+        self._start_compose_thread()
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(_WATCH_INTERVAL_MS)
+        self._watchdog.timeout.connect(self._watch)
+        self._watchdog.start()
+        log_event("watchdog", "on: checks the compositor and both decoders every second")
         threading.Thread(target=warmup_ffmpeg, name="ffmpeg-warmup", daemon=True).start()
         self.ndi_status_changed.emit(self._sender.status, self._sender.available)
         self.decoder_status_changed.emit(self.decoder_status)
@@ -300,10 +331,15 @@ class Engine(QObject):
         elif was_black:
             self._set_playback_blackout(False)
             self._push_dimmed_now()
+            # The monitor may have been holding the clip picked under black.
+            # Now that output is live again, show the real preview bus.
+            self._emit_preview_frame()
         self.dimmer_changed.emit(self.dimmer)
         self._wake_compose()
 
     def load_preview(self, path) -> None:
+        with self._compose_lock:
+            self._preview_gui_dirty = False
         if self.mix > 0:
             self.set_mix(0.0)
         if self._blacked_out() or self.mix <= 0.001:
@@ -329,8 +365,8 @@ class Engine(QObject):
                         self._submit_opaque_black()
                         self._set_playback_blackout(True)
                         if self._gui_enabled:
-                            self.preview.copy_array(self._pvw_np)
-                            self.preview_changed.emit(_scale_gui_array(self._pvw_np))
+                            serial = self.preview.copy_array(self._pvw_np)
+                            self._post_preview(_scale_gui_array(self._pvw_np), serial)
             finally:
                 self._taking = False
             if had_preview and not self._blacked_out():
@@ -339,14 +375,104 @@ class Engine(QObject):
         self.taken.emit()
         self._wake_compose()
 
+    def _start_compose_thread(self) -> bool:
+        """Start the compose thread unless one is running. True if it started one."""
+        with self._compose_thread_lock:
+            if not self._compose_running:
+                return False
+            current = self._compose_thread
+            if current is not None and current.is_alive():
+                return False
+            thread = threading.Thread(target=self._compose_thread_main, name="compose", daemon=True)
+            self._compose_thread = thread
+            thread.start()
+            return True
+
+    def _compose_thread_main(self) -> None:
+        try:
+            self._compose_run()
+        except BaseException as exc:
+            log_exception("compose thread", exc)
+        finally:
+            # In finally, so a new thread starts even if the error could not
+            # be logged. On 1 Nov this call came after the logging, and a
+            # logging failure would have skipped it.
+            self._on_compose_thread_finished()
+
+    def _on_compose_thread_finished(self) -> None:
+        with self._compose_thread_lock:
+            if self._compose_thread is threading.current_thread():
+                self._compose_thread = None
+            restart = self._compose_running
+        if restart:
+            log_event("compose", "the compose thread ended while the pane was running; starting a new one")
+            self._start_compose_thread()
+
+    @Slot()
+    def _watch(self) -> None:
+        try:
+            self.check_playback()
+        except Exception as exc:
+            log_exception("watchdog", exc)
+
+    def check_playback(self, now: float | None = None) -> list[str]:
+        """Restart the compositor or a decoder that has stopped.
+
+        Runs every second on the GUI thread, so it keeps working when those
+        threads die. Returns what it found; each line is also written to the
+        session log.
+        """
+        if now is None:
+            now = time.monotonic()
+        judge = self._last_check is not None and 0.0 <= now - self._last_check <= _CHECK_GAP
+        self._last_check = now
+        found: list[str] = []
+        if self._compose_running:
+            found += self._check_compose(now, judge)
+            for bus in (self.program, self.preview):
+                line = bus.check_decoder(now, _DECODER_STUCK, judge)
+                if line:
+                    found.append(line)
+        for line in found:
+            log_event("watchdog", line)
+        return found
+
+    def _check_compose(self, now: float, judge: bool) -> list[str]:
+        thread = self._compose_thread
+        if thread is None or not thread.is_alive():
+            if not self._start_compose_thread():
+                return []
+            self._watched_ticks = -1
+            return ["the compositor had stopped; started it again"]
+        ticks = self._compose_ticks
+        if not judge or ticks != self._watched_ticks:
+            self._watched_ticks = ticks
+            self._watched_ticks_since = now
+            self._compose_stuck_reported = False
+            return []
+        idle = now - self._watched_ticks_since
+        if idle < _COMPOSE_STUCK or self._compose_stuck_reported:
+            return []
+        self._compose_stuck_reported = True
+        return [
+            f"the compositor has been on the same frame for {idle:.0f} s. It cannot be restarted "
+            f"while it is stuck. Where it is waiting:\n{thread_stack(thread).rstrip()}"
+        ]
+
     def _compose_run(self) -> None:
         next_t = time.perf_counter()
         while self._compose_running:
+            self._compose_ticks += 1
             sleep_until(next_t, lambda: self._compose_running)
             if not self._compose_running:
                 break
-            with self._compose_lock:
-                self._compose_unlocked()
+            try:
+                with self._compose_lock:
+                    self._compose_unlocked()
+            except Exception as exc:
+                # One bad frame used to kill this thread for the rest of the
+                # session. Preview, Program, and NDI then stayed on the last picture.
+                log_exception("compose", exc)
             interval = 1.0 / max(1, self.config.fps)
             next_t += interval
             now = time.perf_counter()
@@ -376,31 +502,60 @@ class Engine(QObject):
             return
         wait = 0.008 if self.program.is_video else 0.0
         self.program.take_frame(self._pgm_np, timeout=wait)
-        if mix <= 0.001 and dimmer >= 0.999:
-            self._sender.submit_array(self._pgm_np)
+        if mix <= 0.001:
+            if dimmer >= 0.999:
+                shown = self._pgm_np
+            else:
+                shown = _blend(self._pgm_np, self._pgm_np, 0.0, dimmer, self._vignette_r2)
+            self._sender.submit_array(shown)
             if emit_gui:
-                self.program_changed.emit(_scale_gui_array(self._pgm_np))
-                if self._preview_gui_dirty:
-                    self._preview_gui_dirty = False
-                    self.preview.copy_array(self._pvw_np)
-                    self.preview_changed.emit(_scale_gui_array(self._pvw_np))
+                self.program_changed.emit(_scale_gui_array(shown))
+            if self._preview_gui_dirty and self._gui_enabled:
+                self._preview_gui_dirty = False
+                serial = self.preview.copy_array(self._pvw_np)
+                self._post_preview(_scale_gui_array(self._pvw_np), serial)
             return
-        if mix > 0.001:
-            self.preview.take_frame(self._pvw_np, timeout=0.0)
-            mixed = _blend(self._pgm_np, self._pvw_np, mix, dimmer, self._vignette_r2)
-        else:
-            mixed = _blend(self._pgm_np, self._pgm_np, 0.0, dimmer, self._vignette_r2)
+        serial = self.preview.take_frame(self._pvw_np, timeout=0.0)
+        mixed = _blend(self._pgm_np, self._pvw_np, mix, dimmer, self._vignette_r2)
         self._sender.submit_array(mixed)
         if emit_gui:
             self.program_changed.emit(_scale_gui_array(mixed))
-            self.preview_changed.emit(_scale_gui_array(self._pvw_np))
+            self._post_preview(_scale_gui_array(self._pvw_np), serial)
 
     @Slot()
     def _on_program_frame(self) -> None:
         self._wake_compose()
 
+    def _post_preview(self, image: QImage, serial: int) -> None:
+        if image.isNull() or serial != self.preview.current_serial():
+            return
+        self.preview_frame.emit(image, serial)
+
+    @Slot(QImage, int)
+    def _present_preview(self, image: QImage, serial: int) -> None:
+        # The compositor can still be handing the previous mix frame, including
+        # the cleared buffer, after the new still has already been published.
+        if image.isNull() or serial < self._shown_preview_serial:
+            return
+        self._shown_preview_serial = serial
+        self.preview_changed.emit(image)
+
+    def _emit_preview_frame(self) -> None:
+        if not self.preview.has_source:
+            return
+        with self._compose_lock:
+            if self._taking:
+                return
+            self._preview_gui_dirty = False
+            serial = self.preview.copy_array(self._pvw_np)
+            image = _scale_gui_array(self._pvw_np)
+        self._post_preview(image, serial)
+
     @Slot()
     def _on_preview_frame(self) -> None:
+        if self.mix <= 0.001:
+            self._emit_preview_frame()
+            return
         self._preview_gui_dirty = True
         self._wake_compose()
 
@@ -409,10 +564,14 @@ class Engine(QObject):
         self.decoder_status_changed.emit(self.decoder_status)
 
     def close(self) -> None:
+        self._watchdog.stop()
+        log_event("stop", "the pane is closing")
         self._compose_running = False
         self._wake_compose()
-        if self._compose_thread is not None:
-            self._compose_thread.join(timeout=1.5)
+        with self._compose_thread_lock:
+            thread = self._compose_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
         self.preview.clear()
         self.program.clear()
         self._sender.close()
