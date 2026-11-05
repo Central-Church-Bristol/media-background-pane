@@ -161,6 +161,44 @@ def install_error_logging() -> None:
     sys.unraisablehook = unraisable_hook
 
 
+# Kept open for the life of the process: faulthandler writes to it when the
+# process is already crashing, with no chance to open anything.
+_crash_file = None
+
+
+def crash_log_path() -> Path:
+    return session_log_path().with_name("crash.log")
+
+
+def enable_crash_log() -> None:
+    """If the process dies in native code, write every thread's Python stack to crash.log.
+
+    The app calls this once at start. It keeps the file open until the process ends.
+
+    Added 5 Nov 2026: twice the running pane was found with its own Python
+    objects corrupted, as if a native library had written where it should
+    not. If that ever ends in a crash, pythonw would otherwise leave nothing.
+    """
+    global _crash_file
+    if _crash_file is not None:
+        return
+    try:
+        import faulthandler
+
+        path = crash_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        handle = path.open("a", encoding="utf-8")
+        handle.write(f"{_stamp()} crash log armed: pid {os.getpid()}\n")
+        handle.flush()
+        faulthandler.enable(file=handle, all_threads=True)
+        _crash_file = handle
+    except Exception:
+        pass
+
+
 class Throttle:
     """Session-log lines for things that can happen many times a second.
 

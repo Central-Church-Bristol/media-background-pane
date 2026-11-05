@@ -315,6 +315,34 @@ class PythonwTests(unittest.TestCase):
         self.assertIn("could not write the session log (", text)
         self.assertIn("RuntimeError: compose thread died under pythonw \\udc80", text)
 
+    def test_a_crash_in_native_code_leaves_every_threads_stack_in_crash_log(self) -> None:
+        # Since 5 Nov 2026. A process killed by a fault in a native library
+        # runs none of its Python handlers; faulthandler still writes.
+        child = (
+            "import sys, threading, time, faulthandler\n"
+            f"sys.path.insert(0, {str(REPO)!r})\n"
+            "from media_background_pane.log import enable_crash_log\n"
+            "enable_crash_log()\n"
+            "def compose_like():\n"
+            "    time.sleep(30)\n"
+            "threading.Thread(target=compose_like, name='compose', daemon=True).start()\n"
+            "time.sleep(0.2)\n"
+            "def native_fault():\n"
+            "    faulthandler._sigsegv()\n"
+            "native_fault()\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            local, temp = Path(folder) / "Local", Path(folder) / "Temp"
+            local.mkdir()
+            temp.mkdir()
+            env = dict(os.environ, LOCALAPPDATA=str(local), TEMP=str(temp), TMP=str(temp))
+            result = subprocess.run([str(PYTHONW), "-c", child], env=env, timeout=60)
+            text = (local / "Media Background Pane" / "crash.log").read_text(encoding="utf-8", errors="replace")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("crash log armed: pid", text)
+        self.assertIn("native_fault", text)
+        self.assertIn("compose_like", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from .config import Config
-from .log import install_error_logging, log_event
+from .log import enable_crash_log, install_error_logging, log_event
 from .main_window import MainWindow, make_app_icon
 from .priority import prefer_livestream_apps
 from .timing import begin_precise_timer, end_precise_timer
@@ -36,6 +36,7 @@ def _prepare_windows_shell() -> None:
 def main() -> None:
     startup = "--startup" in sys.argv
     install_error_logging()
+    enable_crash_log()
     # One line per start, so the log shows it works and when the pane started.
     launched = " --startup" if startup else ""
     log_event("start", f"pid {os.getpid()}, {Path(sys.executable).name}{launched}, Python {platform.python_version()}")
