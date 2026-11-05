@@ -39,6 +39,50 @@ The user saw about 20% CPU (three of the Ryzen's 16 threads), choppy playback at
 
 ## Measured (5 Nov 2026)
 
+### Before and after, with the measuring kit
+
+Measured by `tests/bench_pipeline.py`, the same kit for both versions (`perf-baseline.md` explains it):
+- the real Engine, headless;
+- test clips whose frames carry their own numbers, so repeats and skips can be counted on the output;
+- an NDI stand-in;
+- 60 s per scenario;
+- CPU from cycle counts, as a share of one of the 16 threads.
+
+"Before" is today's code (commit 306194f), measured at 17:38–18:36. "After" is this branch, measured at 18:50–19:40, with less other load on the PC (0.6–1.9 cores against 1.0–4.2).
+
+| Quality | Scenario | Intervals p99 / max, ms | Worst clip: repeats / skips | CPU, total |
+| --- | --- | --- | --- | --- |
+| 540p | Program only | 42.0 / 42.2 → 42.5 / 42.7 | 0 / 0 → 0 / 0 | 79% → 14% |
+| 540p | MIX 0.5 | 45.4 / 47.6 → 42.6 / 42.6 | 0 / 0 → 0 / 0 | 209% → 29% |
+| 540p | Fade button (Takes) | 46.7 / 61.2 → 42.6 / 43.1 | 0.4% / 0.2% → 0 / 0 | 189% → 24% |
+| 540p | Fade to Black and back | 48.5 / 73.7 → 42.6 / 42.7 | 0 / 0 → 0 / 0 | 129% → 13% |
+| 540p | Fade under DIM 0.5 | 74.8 / 86.2 → 42.6 / 42.6 | 0.4% / 36.4% → 0 / 0 | 259% → 26% |
+| 1080p | Program only | 50.4 / 52.6 → 42.4 / 42.6 | 83.5% / 0 → 0 / 0 | 104% → 17% |
+| 1080p | MIX 0.5 | 109.3 / 116.4 → 42.5 / 42.6 | 82.2% / 0 → 0 / 0 | 256% → 46% |
+| 1080p | Fade button (Takes) | 102.5 / 115.3 → 42.6 / 42.6 | 83.0% / 0 → 0 / 0 | 203% → 34% |
+| 1080p | Fade to Black and back | 170.4 / 183.7 → 42.5 / 42.6 | 68.3% / 0 → 0 / 0 | 141% → 25% |
+| 1080p | Fade under DIM 0.5 | 312.6 / 343.0 → 42.6 / 42.8 | 50.6% / 1.1% → 0 / 0 | 239% → 40% |
+
+How to read this:
+- **Intervals:** the time between frames going out. At 24 fps each should be 41.7 ms, so after the rebuild every frame left within 1.3 ms of its slot.
+- **Repeats and skips:** "Before" at 1080p repeated most frames, because the old frame readers could not keep up; the clips played in slow motion.
+- **CPU:** the "before" figures at 1080p are for a pane that could not keep up, so 1080p's real cost before was higher still.
+- **Takes:** every Take, at both sizes, now has no repeat or skip across it. Before, each one held for about 80 ms and then jumped.
+- The Fade to Black row is the rerun after black was put on the beat (`after-black.json`).
+
+**More after-runs:**
+
+| Run | Result |
+| --- | --- |
+| 1080p MIX 0.5 for 10 minutes | 14,400 frames: every one a new frame of both clips, p99 42.6 ms, max 42.9 ms. 44% of one core, about 2.8% of the PC in Task Manager. |
+| Real NDI, with a receiver in another process | Every frame sent was received (1440 of 1440), each the clip's next frame. At the receiver: p99 43–49 ms, max 51 ms. 1080p MIX 0.5 costs 69% of one core including NDI's own threads (16%), against 265% before. |
+| Library clips (Holy Fire, Leaves), from G: | The same smoothness. 1080p MIX 0.5: 45% of one core. |
+| 720p, and the 30 fps H.264 clip | The same: every frame on time. |
+
+The results are in `%TEMP%\mbp-bench\results`, as `after*.json`.
+
+### Other checks
+
 These ran while the PC was busy with other tests, so the CPU numbers are on the high side.
 
 **Real ffmpeg, Holy Fire (HEVC 1080p24), `tests/check_playback_speed.py`:**
@@ -86,7 +130,7 @@ These ran while the PC was busy with other tests, so the CPU numbers are on the 
 
    - **No `compose: no new frame ready in time` lines** means every frame was on time.
    - **`gui: the window thread was blocked for ...`** means a fade was held up, and the line says by what.
-4. **Task Manager:** with two clips blending, the pane and its two ffmpeg processes together should sit around 3% CPU.
+4. **Task Manager:** with two clips blending at 1080p, the pane and its two ffmpeg processes together should sit around 3–5% CPU, NDI included. Before, it was about 16% at 1080p, which did not keep up, and 13–16% at 540p.
 
 ## Not tested
 
