@@ -23,6 +23,11 @@ try:  # OpenCV does the per-pixel work about 15x faster than numpy.
     import cv2
 except ImportError:  # pragma: no cover - the app still works, just slower
     cv2 = None
+else:
+    # One thread: each operation takes about a millisecond at 1080p, and a
+    # pool of 16 worker threads woken 24 times a second costs more CPU than
+    # it saves, and competes with ProPresenter for cores.
+    cv2.setNumThreads(1)
 
 Y_BLACK = 16
 UV_BLACK = 128

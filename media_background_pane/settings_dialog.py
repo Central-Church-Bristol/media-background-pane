@@ -34,10 +34,10 @@ HELP = """ProPresenter input (same PC):
 5. Settings → Network → Enable Network
    (the pane auto-triggers the first video input on startup)
 
-540p / 24fps is the default. GPU decode (D3D11VA) plays
-1080p files without the pane doing a heavy CPU decode.
-The on-screen monitors stay tiny so they do not steal
-time from the livestream.
+1080p / 24fps is the default. GPU decode (NVDEC on NVIDIA
+cards, D3D11VA on others) plays 1080p files, and blends two
+of them, with very little CPU. The on-screen monitors stay
+tiny so they do not steal time from the livestream.
 
 iPad: on the same Wi-Fi as this PC, open the iPad URL shown
 below in Safari as http:// (not https://). Chrome often
@@ -87,9 +87,9 @@ class SettingsDialog(QDialog):
 
         self.workspace = QLineEdit(config.workspace_name)
         self.quality = QComboBox()
-        self.quality.addItem("High — 1080p", "1080p")
+        self.quality.addItem("High — 1080p (recommended)", "1080p")
         self.quality.addItem("Balanced — 720p", "720p")
-        self.quality.addItem("Performance — 540p (recommended)", "540p")
+        self.quality.addItem("Performance — 540p", "540p")
         self.quality.addItem("Lightest — 360p", "360p")
         q_index = self.quality.findData(config.quality)
         self.quality.setCurrentIndex(max(0, q_index))
@@ -102,7 +102,7 @@ class SettingsDialog(QDialog):
             index = self.fps.findData(24)
         self.fps.setCurrentIndex(max(0, index))
 
-        self.use_gpu = QCheckBox("Use GPU decode (D3D11VA)")
+        self.use_gpu = QCheckBox("Use GPU decode (NVDEC / D3D11VA)")
         self.use_gpu.setChecked(config.use_gpu_decode)
         decoder = QLabel(decoder_status or "Unknown")
         decoder.setWordWrap(True)

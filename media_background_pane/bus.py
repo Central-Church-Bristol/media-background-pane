@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QImage, QImageReader, QPainter
 from PySide6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
 
 from .config import GUI_FPS, SCALE_ACTUAL, SCALE_FILL, SCALE_FIT, SCALE_MODES
+from . import hw_decoder
 from .frames import bgra_to_nv12, black, copy_into
 from .hw_decoder import HwDecoder, find_ffmpeg
 from .ndi_output import qimage_to_array
@@ -120,7 +121,12 @@ def idle_decoder_status(use_gpu: bool) -> str:
     if find_ffmpeg() is None:
         return "Qt fallback (ffmpeg not found)"
     if use_gpu:
-        return "GPU (D3D11VA)"
+        cuda = hw_decoder.cuda_available()
+        if cuda is True:
+            return "GPU (NVDEC)"
+        if cuda is False:
+            return "GPU (D3D11VA)"
+        return "GPU"
     return "Software fallback"
 
 

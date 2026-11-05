@@ -158,6 +158,9 @@ class ComposeTests(unittest.TestCase):
                 self.config = type("Config", (), {"fps": 1000})()
                 self.ticks = 0
 
+            def _send_staged(self) -> None:
+                pass
+
             def _compose_unlocked(self) -> None:
                 self.ticks += 1
                 if self.ticks == 1:

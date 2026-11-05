@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 import time
 
@@ -81,6 +82,13 @@ class Engine(QObject):
         self._mixer = Mixer(width, height)
         self._pgm_np = black(width, height)
         self._pvw_np = black(width, height)
+        # The frame composed on the last tick, sent at the start of the next.
+        # Sending first and composing after makes the moment each frame goes
+        # out independent of how long composing took (a fade under DIM takes
+        # longer than a cut), at the cost of one frame of delay.
+        self._out_lock = threading.Lock()
+        self._out = black(width, height)
+        self._out_ready = False
         self._sender = NdiSender(config.ndi_name, config.fps, width, height)
         self._gui_enabled = True
         self._taking = False
@@ -153,9 +161,26 @@ class Engine(QObject):
         return image
 
     def _submit_opaque_black(self) -> None:
-        self._sender.submit_array(self._mixer.black)
+        # Now, not on the next tick, and drop a composed frame that is not black.
+        with self._out_lock:
+            self._out_ready = False
+            self._sender.submit_array(self._mixer.black)
         if self._gui_enabled:
             self.program_changed.emit(self._gui_black())
+
+    def _stage(self, frame: np.ndarray) -> None:
+        """Keep frame to send at the start of the next tick."""
+        with self._out_lock:
+            if self._out.shape != frame.shape:
+                self._out = np.empty_like(frame)
+            np.copyto(self._out, frame)
+            self._out_ready = True
+
+    def _send_staged(self) -> None:
+        with self._out_lock:
+            if self._out_ready:
+                self._out_ready = False
+                self._sender.submit_array(self._out)
 
     def _wake_compose(self) -> None:
         self._compose_event.set()
@@ -212,6 +237,9 @@ class Engine(QObject):
             self._mixer = Mixer(width, height)
             self._pgm_np = black(width, height)
             self._pvw_np = black(width, height)
+            with self._out_lock:
+                self._out = black(width, height)
+                self._out_ready = False
             self._sender.set_size(width, height)
         self.ndi_status_changed.emit(self._sender.status, self._sender.available)
         self._wake_compose()
@@ -289,8 +317,9 @@ class Engine(QObject):
                             self._post_preview(_scale_gui_array(self._pvw_np), serial)
             finally:
                 self._taking = False
-            if had_preview and not self._blacked_out():
-                self._compose_unlocked()
+            # No compose here: the next tick composes from the swapped buses.
+            # Composing now took an extra frame from the new Program between
+            # two ticks, so the output skipped one frame at every take.
         self.mix_changed.emit(0.0)
         self.taken.emit()
         self._wake_compose()
@@ -312,6 +341,8 @@ class Engine(QObject):
         try:
             # Its timing is the output's timing, and it needs only a few ms a frame.
             raise_thread_priority()
+            # When it wakes, it gets the GIL within about 1 ms instead of 5.
+            sys.setswitchinterval(0.001)
             self._compose_run()
         except BaseException as exc:
             log_exception("compose thread", exc)
@@ -399,6 +430,7 @@ class Engine(QObject):
                 break
             try:
                 with self._compose_lock:
+                    self._send_staged()
                     self._compose_unlocked()
             except Exception as exc:
                 # One bad frame used to kill this thread for the rest of the
@@ -450,14 +482,14 @@ class Engine(QObject):
         mixer = self._mixer
         emit_gui = self._emit_gui()
         if dimmer <= 0.001:
-            self._sender.submit_array(mixer.black)
+            self._stage(mixer.black)
             if emit_gui:
                 self.program_changed.emit(self._gui_black())
             return
         self._take(self.program, self._pgm_np)
         if mix <= 0.001:
             shown = mixer.dim(self._pgm_np, dimmer)
-            self._sender.submit_array(shown)
+            self._stage(shown)
             if emit_gui:
                 self.program_changed.emit(_scale_gui_array(shown))
             if self._preview_gui_dirty and self._gui_enabled:
@@ -469,7 +501,7 @@ class Engine(QObject):
         serial = self._take(self.preview, self._pvw_np)
         mixed = self._pvw_np if mix >= 0.999 else mixer.blend(self._pgm_np, self._pvw_np, mix)
         shown = mixer.dim(mixed, dimmer)
-        self._sender.submit_array(shown)
+        self._stage(shown)
         if emit_gui:
             self.program_changed.emit(_scale_gui_array(shown))
             self._post_preview(_scale_gui_array(self._pvw_np), serial)
