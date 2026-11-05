@@ -81,6 +81,19 @@ How to read this:
 
 The results are in `%TEMP%\mbp-bench\results`, as `after*.json`.
 
+**Soak test, one hour** (`tests/soak_pipeline.py --minutes 60`, 19:42–20:43):
+- **Set-up:** 1080p 24 fps, with `PYTHONMALLOC=debug` and faulthandler. Real NDI in group `mbp-bench`, with a receiver in another process.
+- **What it did:** 180 operator steps, one every 20 s, at random:
+  - a library clip or the still onto Preview;
+  - a fade across of 2–10 s, then Take;
+  - now and then Fade to Black and back.
+- **Result:**
+  - Not one tick without a new frame on Program or Preview, all hour.
+  - Nothing in the session log but its start and stop.
+  - Private memory 750 MB at 2 min and 681 MB at 60 min, swinging 740–776 MB between. Handles 436 → 432, threads 6 → 6. No leak.
+  - The receiver got 86,046 frames at 1920×1080 over its hour: all of them.
+  - Python's debug allocator, which catches writes over the edge of its own blocks and into freed ones, found nothing.
+
 ### Other checks
 
 These ran while the PC was busy with other tests, so the CPU numbers are on the high side.
@@ -135,5 +148,5 @@ These ran while the PC was busy with other tests, so the CPU numbers are on the 
 ## Not tested
 
 - **With ProPresenter:** it was not opened, by agreement. How ProPresenter shows a 1080p NDI input is to be seen.
-- **A whole service:** the soak test (`tests/soak_pipeline.py`) runs the pipeline the way an operator does, for as long as asked.
+- **A whole service:** the one-hour soak test is the closest. Longer runs are one option away: `--minutes`.
 - **The iPad remote:** it uses the same monitor images as before, and it was not tried.
