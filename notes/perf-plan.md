@@ -169,14 +169,39 @@ Keep the structure: Bus, Engine, HwDecoder, NdiSender and the watchdog. Change w
 
 ## Who does what
 
-| Part | Session | Files it owns |
-| --- | --- | --- |
-| A. Pipeline rebuild | `perf-pipeline` | `hw_decoder.py`, `bus.py`, `engine.py`, `ndi_output.py`, `timing.py`, `config.py`, `requirements.txt`, README's quality wording, tests for these, `notes/perf-pipeline.md` |
-| B. Measuring kit and before numbers | `perf-bench` | new files only: `tests/bench_*.py`, `tests/make_bench_clips.py`, `notes/perf-baseline.md` |
-| C. GUI-thread stalls | `perf-gui-thread` | `main_window.py`, `propresenter.py` (and `library.py` if needed), new tests, `notes/gui-thread.md` |
-| Integration, after numbers, report | director | merges into `worktree-perf-1080p` |
+The user is on Remote Control, and side sessions can't be started from there. So everything happens in the director's worktree (`.claude\worktrees\perf-1080p`, branch `worktree-perf-1080p`). Helper agents work on files that don't overlap, and only the director commits.
 
-A session that needs a file it does not own keeps the change minimal and says so in its report.
+| Part | Who | Files it owns |
+| --- | --- | --- |
+| A. Pipeline rebuild | director | `hw_decoder.py`, `bus.py`, `engine.py`, `ndi_output.py`, `timing.py`, `config.py`, `log.py`, `requirements.txt`, README's quality wording, tests for these, `notes/perf-pipeline.md` |
+| B. Measuring kit and before numbers | helper agent | new files only: `tests/bench_*.py`, `tests/make_bench_clips.py`, `notes/perf-baseline.md` |
+| C. GUI-thread stalls | helper agent | `main_window.py`, `propresenter.py` (and `library.py` if needed), new tests, `notes/gui-thread.md` |
+| Integration, after numbers, report | director | commits on `worktree-perf-1080p` |
+
+Anyone who needs a file they don't own keeps the change minimal and says so in their report.
+
+## Found on 5 Nov: the live pane's memory looks corrupted again
+
+**What the live pane (pid 22024, started 23:20 on 4 Nov) logs:**
+- Since at least 15:43, its watchdog has failed every few seconds with `AssertionError` "Thread.__init__() not called", from `thread.is_alive()` on the compose thread.
+- The final line of each traceback reads `None: ...`. Python's `traceback` module prints that only when the exception's type is None, which a working interpreter can't produce.
+- `py-spy dump` shows the compose thread alive in `sleep_until`. So playback runs, but the watchdog can't check it.
+
+**What it costs:**
+- The repeated traceback (about 1.2 KB every 5 s) fills `session.log` and its one rotation in under an hour. That pushed out the restart lines from the night before.
+
+**The pattern:**
+- This follows the impossible errors of 4 Nov: `isdir` false on an existing folder, and `re.compile` rejecting a fixed string.
+- It may also explain the threads that ended silently on 31 Oct and 2 Nov.
+- Suspected: a native component corrupting Python's memory. Not found yet.
+- Ruled out so far:
+  - the ndi-python `data` setter, which keeps exactly one reference to the current array
+  - `_publish_decoder_frame`, the long-lived QImage over numpy memory, which is never called
+
+**What to do in the rebuild:**
+- Keep the buffers that native code reads strictly alive.
+- Don't delete QObjects while another thread can still emit their signals. Today `Bus._stop_decoder` calls `deleteLater()` from a reaper thread, even when the decoder thread has not finished in 2 s.
+- Make repeated identical errors collapse in the log.
 
 ## Done means
 
