@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import zipfile
-from queue import Empty, Full, Queue
+from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.request import Request, urlopen
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from .config import SCALE_ACTUAL, SCALE_FILL, SCALE_MODES
+from .frames import copy_into, nv12_shape
 from .log import log_exception
-from .timing import sleep_until
 
 CREATE_NO_WINDOW = 0x08000000
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
@@ -26,10 +25,15 @@ JobObjectExtendedLimitInformation = 9
 
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 _FIRST_FRAME_TIMEOUT = 3.0
-# A read that sits this long after frames have been flowing is a stuck ffmpeg
-# or a hung media file (Google Drive dropping out). Kill it and open the clip again.
+# A read that waits this long for ffmpeg, while there is room for the frame,
+# is a stuck ffmpeg or a hung media file (Google Drive dropping out). Kill it
+# and open the clip again. Waiting for the compositor to take frames, or being
+# paused, never counts: that is the normal way playback is paced.
 _STALL_TIMEOUT = 8.0
-_SIZE_RE = re.compile(r"Video:\s*.*?(\d{2,5})x(\d{2,5})")
+# Frames decoded ahead of the compositor: about half a second, so a slow read
+# from Google Drive or the jump back at a loop point does not show.
+_MIN_DEPTH = 4
+_MAX_DEPTH = 16
 
 _ffmpeg_path: Optional[Path] = None
 _has_scale_d3d11: Optional[bool] = None
@@ -114,9 +118,19 @@ def ensure_ffmpeg() -> Optional[Path]:
 
 
 def warmup_ffmpeg() -> None:
-    if find_ffmpeg() is None:
+    """Run ffmpeg once, so the first clip does not wait for it to load from disk."""
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
         return
-    _has_filter("scale_d3d11")
+    try:
+        subprocess.run(
+            [str(ffmpeg), "-hide_banner", "-version"],
+            capture_output=True,
+            timeout=8,
+            creationflags=_creation_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def _creation_flags() -> int:
@@ -168,7 +182,12 @@ def _ensure_job():
         ]
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
     kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     handle = kernel32.CreateJobObjectW(None, None)
     if not handle:
         return None
@@ -197,7 +216,7 @@ def _assign_job(proc: subprocess.Popen) -> None:
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    kernel32.AssignProcessToJobObject(handle, raw)
+    kernel32.AssignProcessToJobObject(handle, int(raw))
 
 
 def _has_filter(name: str) -> bool:
@@ -225,91 +244,123 @@ def _has_filter(name: str) -> bool:
     return found
 
 
-def _probe_size(path: Path) -> Optional[tuple[int, int]]:
-    ffmpeg = find_ffmpeg()
-    if ffmpeg is None:
-        return None
-    try:
-        result = subprocess.run(
-            [str(ffmpeg), "-hide_banner", "-i", str(path)],
-            capture_output=True,
-            timeout=8,
-            creationflags=_creation_flags(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    text = (result.stderr or b"").decode("utf-8", "replace")
-    match = _SIZE_RE.search(text)
-    if not match:
-        return None
-    return int(match.group(1)), int(match.group(2))
-
-
-def _fit_inside(src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, int]:
-    scale = min(out_w / max(1, src_w), out_h / max(1, src_h))
-    width = max(2, int(src_w * scale) // 2 * 2)
-    height = max(2, int(src_h * scale) // 2 * 2)
-    return width, height
-
-
-def _cover_size(src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, int]:
-    scale = max(out_w / max(1, src_w), out_h / max(1, src_h))
-    width = max(2, int(round(src_w * scale / 2.0)) * 2)
-    height = max(2, int(round(src_h * scale / 2.0)) * 2)
-    if width < out_w or height < out_h:
-        extra = max(out_w / max(1, width), out_h / max(1, height))
-        width = max(out_w, int(round(width * extra / 2.0)) * 2)
-        height = max(out_h, int(round(height * extra / 2.0)) * 2)
-    return width, height
+def queue_depth(fps: int) -> int:
+    """How many decoded frames wait for the compositor: about half a second."""
+    return max(_MIN_DEPTH, min(_MAX_DEPTH, int(fps) // 2))
 
 
 def _crop_pad(width: int, height: int) -> str:
-    crop = "crop=min(iw\\," + str(width) + "):min(ih\\," + str(height) + ")"
-    return f"{crop},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+    # Even sizes and offsets, so the half-resolution chroma lines up.
+    crop = (
+        "crop=trunc(min(iw\\," + str(width) + ")/2)*2:trunc(min(ih\\," + str(height) + ")/2)*2"
+    )
+    return f"{crop},pad={width}:{height}:trunc((ow-iw)/4)*2:trunc((oh-ih)/4)*2:black"
 
 
-def _vf_cpu(width: int, height: int, fps: int, flags: str, mode: str) -> str:
+def _vf(width: int, height: int, fps: int, mode: str, flags: str) -> str:
+    """The ffmpeg filter chain: rate first, then size, then NV12 in BT.709.
+
+    fps comes first so frames it drops are never scaled. When the clip is
+    already the output size, scale and crop pass frames straight through at
+    no cost (measured 5 Nov 2026). out_color_matrix converts clips tagged with
+    another matrix (SD BT.601, say); BT.709 clips pass through unchanged.
+    """
+    rate = f"fps={max(1, fps)}"
     if mode == SCALE_FILL:
-        scale = (
-            f"scale={width}:{height}:force_original_aspect_ratio=increase:flags={flags},"
-            f"crop={width}:{height},"
+        size = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase:force_divisible_by=2:"
+            f"flags={flags}:out_color_matrix=bt709,crop={width}:{height}"
         )
     elif mode == SCALE_ACTUAL:
-        scale = _crop_pad(width, height) + ","
+        size = f"scale=out_color_matrix=bt709,{_crop_pad(width, height)}"
     else:
-        scale = (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags={flags},"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+        size = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2:"
+            f"flags={flags}:out_color_matrix=bt709,"
+            f"pad={width}:{height}:trunc((ow-iw)/4)*2:trunc((oh-ih)/4)*2:black"
         )
-    return f"{scale}format=bgra,fps={max(1, fps)}"
+    return f"{rate},{size},format=nv12"
 
 
-def _vf_d3d11(
-    src_w: int,
-    src_h: int,
-    width: int,
-    height: int,
-    fps: int,
-    mode: str,
-) -> str:
-    tail = f"fps={max(1, fps)}"
-    if mode == SCALE_FILL:
-        cover_w, cover_h = _cover_size(src_w, src_h, width, height)
-        return (
-            f"scale_d3d11={cover_w}:{cover_h},"
-            f"hwdownload,format=bgra,{_crop_pad(width, height)},{tail}"
-        )
-    if mode == SCALE_ACTUAL:
-        return f"hwdownload,format=bgra,{_crop_pad(width, height)},{tail}"
-    fit_w, fit_h = _fit_inside(src_w, src_h, width, height)
-    return (
-        f"scale_d3d11={fit_w}:{fit_h},"
-        f"hwdownload,format=bgra,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,{tail}"
-    )
+class _Frames:
+    """The decoded frames of one clip start: a pool of buffers and a queue in order.
+
+    The reader takes a free buffer, fills it from ffmpeg and queues it. When
+    `depth` frames are queued it waits for the compositor to take one. That
+    wait is what paces playback: ffmpeg decodes ahead, then waits on the pipe.
+    """
+
+    def __init__(self, shape: tuple[int, int], depth: int) -> None:
+        self.shape = shape
+        self.depth = depth
+        self.cond = threading.Condition()
+        self.ready: deque[np.ndarray] = deque()
+        self.free: list[np.ndarray] = []
+        self.made = 0
+        self.closed = False
+        # When the reader began waiting on ffmpeg for the frame it is reading.
+        # None while it waits for the compositor instead. The stall watch reads it.
+        self.reading_since: float | None = None
+
+    def take_free(self, keep_going: Callable[[], bool]) -> np.ndarray | None:
+        with self.cond:
+            while not self.closed and keep_going():
+                if len(self.ready) < self.depth:
+                    if self.free:
+                        return self.free.pop()
+                    if self.made < self.depth + 2:
+                        self.made += 1
+                        return np.empty(self.shape, dtype=np.uint8)
+                self.cond.wait(0.1)
+            return None
+
+    def put(self, buffer: np.ndarray) -> bool:
+        with self.cond:
+            if self.closed:
+                return False
+            self.ready.append(buffer)
+            self.cond.notify_all()
+            return True
+
+    def give_back(self, buffer: np.ndarray) -> None:
+        with self.cond:
+            if not self.closed and buffer.shape == self.shape:
+                self.free.append(buffer)
+            self.cond.notify_all()
+
+    def pop(self, timeout: float) -> np.ndarray | None:
+        with self.cond:
+            if not self.ready and timeout > 0 and not self.closed:
+                self.cond.wait_for(lambda: bool(self.ready) or self.closed, timeout)
+            if not self.ready:
+                return None
+            return self.ready.popleft()
+
+    def queued(self) -> int:
+        with self.cond:
+            return len(self.ready)
+
+    def drain(self) -> None:
+        with self.cond:
+            while self.ready:
+                self.free.append(self.ready.popleft())
+            self.cond.notify_all()
+
+    def close(self) -> None:
+        with self.cond:
+            self.closed = True
+            self.ready.clear()
+            self.free.clear()
+            self.cond.notify_all()
 
 
 class HwDecoder(QObject):
+    """Plays one clip through ffmpeg and hands its frames on in order, as NV12.
+
+    It has no clock of its own. The compositor takes one frame per output
+    tick, and the decoder keeps up to half a second decoded ahead of it.
+    """
+
     frame_ready = Signal()
     status_changed = Signal(str)
 
@@ -325,11 +376,7 @@ class HwDecoder(QObject):
         self._scale_mode = SCALE_FILL
         self._running = False
         self._paused = False
-        self._unpause = threading.Event()
-        self._unpause.set()
-        self._lock = threading.Lock()
-        self._latest: Optional[np.ndarray] = None
-        self._queue: Queue = Queue(maxsize=2)
+        self._frames: _Frames | None = None
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._generation = 0
@@ -342,55 +389,48 @@ class HwDecoder(QObject):
 
     def thread_alive(self) -> bool:
         thread = self._thread
-        return thread is not None and thread.is_alive()
-
-    def copy_frame(self, dest: np.ndarray) -> bool:
-        with self._lock:
-            if self._latest is None:
-                return False
-            if self._latest.shape != dest.shape:
-                dest.fill(0)
-                dest[..., 3] = 255
-                h = min(self._latest.shape[0], dest.shape[0])
-                w = min(self._latest.shape[1], dest.shape[1])
-                dest[:h, :w] = self._latest[:h, :w]
-                return True
-            np.copyto(dest, self._latest)
+        if thread is None:
+            return False
+        try:
+            return thread.is_alive()
+        except Exception:
+            # On 5 Nov 2026 the running pane's Thread objects started failing
+            # their own checks. Say "alive": the frame count still shows a stall.
             return True
 
-    def discard_queued(self) -> None:
-        self._drain_queue(keep_latest=True)
+    def queued(self) -> int:
+        frames = self._frames
+        return frames.queued() if frames is not None else 0
 
     def pop_frame(self, dest: np.ndarray, timeout: float = 0.0) -> bool:
+        """Copy the next frame, in order, into dest. False if none came within timeout."""
+        frames = self._frames
+        if frames is None:
+            return False
+        buffer = frames.pop(max(0.0, timeout))
+        if buffer is None:
+            return False
         try:
-            frame = self._queue.get(timeout=max(0.0, timeout))
-        except Empty:
-            return False
-        if frame is None:
-            return False
-        if frame.shape != dest.shape:
-            dest.fill(0)
-            dest[..., 3] = 255
-            h = min(frame.shape[0], dest.shape[0])
-            w = min(frame.shape[1], dest.shape[1])
-            dest[:h, :w] = frame[:h, :w]
-            return True
-        np.copyto(dest, frame)
-        dest[..., 3] = 255
+            copy_into(dest, buffer)
+        finally:
+            frames.give_back(buffer)
         return True
 
-    def _drain_queue(self, keep_latest: bool = False) -> None:
-        last = None
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except Empty:
-                break
-            if item is not None:
-                last = item
-        if keep_latest and last is not None:
-            with self._lock:
-                self._latest = last
+    def copy_frame(self, dest: np.ndarray) -> bool:
+        """Copy the newest decoded frame without taking it. Breaks continuity: avoid."""
+        frames = self._frames
+        if frames is None:
+            return False
+        with frames.cond:
+            if not frames.ready:
+                return False
+            copy_into(dest, frames.ready[-1])
+        return True
+
+    def discard_queued(self) -> None:
+        frames = self._frames
+        if frames is not None:
+            frames.drain()
 
     def start(
         self,
@@ -404,17 +444,14 @@ class HwDecoder(QObject):
     ) -> None:
         self.stop()
         self._path = path
-        self._width = max(2, width)
-        self._height = max(2, height)
+        self._width = max(2, int(width) // 2 * 2)
+        self._height = max(2, int(height) // 2 * 2)
         self._fps = max(1, fps)
         self._want_gpu = gpu
         self._scale_mode = scale_mode if scale_mode in SCALE_MODES else SCALE_FILL
         self._paused = paused
-        self._queue = Queue(maxsize=2)
-        if paused:
-            self._unpause.clear()
-        else:
-            self._unpause.set()
+        frames = _Frames(nv12_shape(self._width, self._height), queue_depth(self._fps))
+        self._frames = frames
         self._running = True
         self._generation += 1
         generation = self._generation
@@ -423,7 +460,7 @@ class HwDecoder(QObject):
         self._thread = threading.Thread(
             target=self._run,
             name=f"ffmpeg-{self.name}",
-            args=(generation,),
+            args=(generation, frames),
             daemon=True,
         )
         self._thread.start()
@@ -448,24 +485,19 @@ class HwDecoder(QObject):
         )
 
     def set_paused(self, paused: bool) -> None:
+        # Paused means nobody is taking frames. The queue is kept, so playing
+        # again carries on with the very next frame; the reader simply waits
+        # once the queue is full, and ffmpeg waits on the pipe behind it.
         self._paused = paused
-        if paused:
-            self._unpause.clear()
-            self._drain_queue(keep_latest=True)
-        else:
-            self._unpause.set()
 
     def stop(self) -> threading.Thread | None:
         # A GPU ffmpeg often takes about a second to die. Waiting here stalls
         # the click that is trying to put the next clip on Preview.
         self._running = False
         self._paused = False
-        self._unpause.set()
-        self._drain_queue()
-        try:
-            self._queue.put_nowait(None)
-        except Full:
-            pass
+        frames = self._frames
+        if frames is not None:
+            frames.close()
         proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
@@ -485,56 +517,52 @@ class HwDecoder(QObject):
         self.status = status
         self.status_changed.emit(status)
 
-    def _run(self, generation: int) -> None:
+    def _current(self, generation: int) -> bool:
+        return self._running and generation == self._generation
+
+    def _run(self, generation: int, frames: _Frames) -> None:
         try:
-            while self._running and generation == self._generation:
+            while self._current(generation):
                 try:
-                    if not self._run_attempts(generation):
+                    if not self._run_attempts(generation, frames):
                         return
                 except Exception as exc:
                     log_exception(f"decoder {self.name}", exc)
-                if not self._wait_retry(1.0):
+                if not self._wait_retry(1.0, generation):
                     return
         except BaseException as exc:
             # Anything else ends this thread. Log it here; the engine's
             # watchdog starts the clip again.
             log_exception(f"decoder {self.name} thread", exc)
 
-    def _run_attempts(self, generation: int) -> bool:
+    def _run_attempts(self, generation: int, frames: _Frames) -> bool:
         """Try each decode mode once. True means keep trying while this clip is current."""
-        attempts: list[str] = []
-        if self._want_gpu:
-            if _has_filter("scale_d3d11"):
-                attempts.append("gpu-d3d11")
-            attempts.append("gpu")
-        attempts.append("software")
+        attempts = ["gpu", "software"] if self._want_gpu else ["software"]
         produced = False
         for mode in attempts:
-            if not self._running or generation != self._generation:
+            if not self._current(generation):
                 return False
-            if self._play_mode(mode, generation):
+            if self._play_mode(mode, generation, frames):
                 produced = True
                 break
-        if not self._running or generation != self._generation:
+        if not self._current(generation):
             return False
         if not produced:
             self._set_status("Software fallback")
         return True
 
-    def _wait_retry(self, seconds: float) -> bool:
+    def _wait_retry(self, seconds: float, generation: int) -> bool:
         deadline = time.monotonic() + seconds
-        while self._running and time.monotonic() < deadline:
+        while self._current(generation) and time.monotonic() < deadline:
             time.sleep(0.05)
-        return self._running
+        return self._current(generation)
 
-    def _play_mode(self, mode: str, generation: int) -> bool:
+    def _play_mode(self, mode: str, generation: int, frames: _Frames) -> bool:
         ffmpeg = find_ffmpeg()
         path = self._path
         if ffmpeg is None or path is None:
             return False
         cmd = self._command(ffmpeg, path, mode)
-        if cmd is None:
-            return False
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -548,72 +576,39 @@ class HwDecoder(QObject):
             return False
         _assign_job(proc)
         self._proc = proc
-        frame_size = self._width * self._height * 4
         got_frame = threading.Event()
-        last_frame_at = [time.monotonic()]
-        # ffmpeg decodes as fast as it is read, so this loop sets the playback
-        # speed. The fps filter makes each frame 1/fps of a second of the clip,
-        # so read one frame every 1/fps second.
-        interval = 1.0 / max(1, self._fps)
-        next_due: Optional[float] = None
 
-        def may_wait() -> bool:
-            return self._running and generation == self._generation and not self._paused
+        def keep_going() -> bool:
+            return self._current(generation)
 
         threading.Thread(
             target=self._watch_playback,
             name=f"ffmpeg-watch-{self.name}",
-            args=(proc, generation, got_frame, last_frame_at),
+            args=(proc, generation, got_frame, frames),
             daemon=True,
         ).start()
         try:
-            while self._running and generation == self._generation:
-                while self._paused and self._running and generation == self._generation:
-                    if not got_frame.is_set():
-                        break
-                    last_frame_at[0] = time.monotonic()
-                    # Carry on from the paused frame at normal speed. Do not
-                    # rush through the time spent paused.
-                    next_due = None
-                    self._unpause.wait(0.05)
-                if not self._running or generation != self._generation:
+            while self._current(generation):
+                buffer = frames.take_free(keep_going)
+                if buffer is None:
                     break
-                if self._paused and got_frame.is_set():
-                    continue
-                if next_due is not None:
-                    sleep_until(next_due, may_wait)
-                    if not self._running or generation != self._generation:
-                        break
-                    if self._paused and got_frame.is_set():
-                        continue
-                data = self._read_exact(proc, frame_size)
-                if data is None:
+                frames.reading_since = time.monotonic()
+                try:
+                    complete = self._read_into(proc, buffer)
+                finally:
+                    frames.reading_since = None
+                if not complete or not self._current(generation):
+                    frames.give_back(buffer)
                     break
-                if len(data) != frame_size:
+                if not frames.put(buffer):
                     break
-                last_frame_at[0] = time.monotonic()
-                if generation == self._generation:
-                    self.frames_read += 1
-                # The next frame is due one interval after this one. If ffmpeg is
-                # more than two frames late (slow loop restart, slow disk), start
-                # the clock again from now instead of rushing to catch up.
-                now = time.perf_counter()
-                if next_due is None or next_due < now - interval * 2:
-                    next_due = now
-                next_due += interval
-                frame = np.frombuffer(data, dtype=np.uint8).reshape(self._height, self._width, 4).copy()
-                frame[..., 3] = 255
-                with self._lock:
-                    self._latest = frame
-                if not self._enqueue(frame):
-                    break
+                self.frames_read += 1
                 if not got_frame.is_set():
                     got_frame.set()
-                    gpu = mode.startswith("gpu")
-                    self._set_status("GPU (D3D11VA)" if gpu else "Software fallback")
-                self.frame_ready.emit()
-            if got_frame.is_set():
-                return True
+                    self._set_status("GPU (D3D11VA)" if mode == "gpu" else "Software fallback")
+                if self._current(generation):
+                    self.frame_ready.emit()
+            return got_frame.is_set()
         finally:
             if self._proc is proc:
                 self._proc = None
@@ -626,9 +621,8 @@ class HwDecoder(QObject):
                     proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     pass
-        return False
 
-    def _command(self, ffmpeg: Path, path: Path, mode: str) -> Optional[list[str]]:
+    def _command(self, ffmpeg: Path, path: Path, mode: str) -> list[str]:
         cmd = [
             str(ffmpeg),
             "-hide_banner",
@@ -638,19 +632,12 @@ class HwDecoder(QObject):
             "-stream_loop",
             "-1",
         ]
-        vf: Optional[str] = None
-        scale_mode = self._scale_mode
-        if mode == "gpu-d3d11":
-            probed = _probe_size(path)
-            if probed is None:
-                return None
-            cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
-            vf = _vf_d3d11(probed[0], probed[1], self._width, self._height, self._fps, scale_mode)
-        elif mode == "gpu":
+        if mode == "gpu":
+            # Decoded on the GPU and handed back as NV12, the format it decodes to.
             cmd += ["-hwaccel", "d3d11va"]
-            vf = _vf_cpu(self._width, self._height, self._fps, "lanczos", scale_mode)
+            flags = "bicubic"
         else:
-            vf = _vf_cpu(self._width, self._height, self._fps, "fast_bilinear", scale_mode)
+            flags = "bilinear"
         cmd += [
             "-i",
             str(path),
@@ -658,61 +645,52 @@ class HwDecoder(QObject):
             "-map",
             "0:v:0",
             "-vf",
-            vf,
+            _vf(self._width, self._height, self._fps, self._scale_mode, flags),
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "bgra",
+            "nv12",
             "pipe:1",
         ]
         return cmd
-
-    def _enqueue(self, frame: np.ndarray) -> bool:
-        # Drop the oldest frame instead of waiting. A blocked put fills the
-        # ffmpeg pipe and freezes the picture until the process is restarted.
-        # Playback speed is set by the reader in _play_mode, not by this queue.
-        while self._running:
-            if self._paused:
-                return True
-            try:
-                self._queue.put_nowait(frame)
-                return True
-            except Full:
-                try:
-                    self._queue.get_nowait()
-                except Empty:
-                    continue
-        return False
 
     def _watch_playback(
         self,
         proc: subprocess.Popen,
         generation: int,
         got_frame: threading.Event,
-        last_frame_at: list[float],
+        frames: _Frames,
     ) -> None:
         if not got_frame.wait(_FIRST_FRAME_TIMEOUT) and proc.poll() is None:
             _kill_proc(proc)
             return
-        while proc.poll() is None and self._running and generation == self._generation:
+        while proc.poll() is None and self._current(generation):
             time.sleep(0.25)
-            if self._paused:
-                last_frame_at[0] = time.monotonic()
-                continue
-            if time.monotonic() - last_frame_at[0] > _STALL_TIMEOUT:
+            since = frames.reading_since
+            if since is not None and time.monotonic() - since > _STALL_TIMEOUT:
                 _kill_proc(proc)
                 return
 
-    def _read_exact(self, proc: subprocess.Popen, size: int) -> Optional[bytes]:
+    def _read_into(self, proc: subprocess.Popen, buffer: np.ndarray) -> bool:
+        """Fill buffer with one frame from ffmpeg. False at the end of the pipe."""
         stdout = proc.stdout
         if stdout is None:
-            return None
-        buf = bytearray()
-        while len(buf) < size:
+            return False
+        view = memoryview(buffer).cast("B")
+        size = len(view)
+        readinto = getattr(stdout, "readinto", None)
+        got = 0
+        while got < size:
             if not self._running:
-                return None
-            chunk = stdout.read(size - len(buf))
-            if not chunk:
-                return None
-            buf += chunk
-        return bytes(buf)
+                return False
+            if readinto is not None:
+                count = readinto(view[got:])
+            else:
+                chunk = stdout.read(size - got)
+                count = len(chunk) if chunk else 0
+                if count:
+                    view[got : got + count] = chunk
+            if not count:
+                return False
+            got += count
+        return True

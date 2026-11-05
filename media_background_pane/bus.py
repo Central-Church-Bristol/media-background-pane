@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QImage, QImageReader, QPainter
 from PySide6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
 
 from .config import GUI_FPS, SCALE_ACTUAL, SCALE_FILL, SCALE_FIT, SCALE_MODES
+from .frames import bgra_to_nv12, black, copy_into
 from .hw_decoder import HwDecoder, find_ffmpeg
 from .ndi_output import qimage_to_array
 
@@ -75,7 +76,8 @@ def place_rgb(source: QImage, width: int, height: int, mode: str = SCALE_FILL) -
         if mode == SCALE_FIT
         else Qt.AspectRatioMode.KeepAspectRatioByExpanding
     )
-    scaled = src.scaled(width, height, aspect, Qt.TransformationMode.FastTransformation)
+    # Smooth: a still is scaled once, and nearest-pixel scaling showed jaggies.
+    scaled = src.scaled(width, height, aspect, Qt.TransformationMode.SmoothTransformation)
     if scaled.format() != QImage.Format.Format_RGB32:
         scaled = scaled.convertToFormat(QImage.Format.Format_RGB32)
     if scaled.width() == width and scaled.height() == height:
@@ -89,6 +91,13 @@ def place_rgb(source: QImage, width: int, height: int, mode: str = SCALE_FILL) -
 
 def fit_rgb(source: QImage, width: int, height: int) -> QImage:
     return place_rgb(source, width, height, SCALE_FIT)
+
+
+def qimage_to_nv12(image: QImage, width: int, height: int) -> np.ndarray:
+    """A width x height RGB32 QImage as a new NV12 frame."""
+    bgra = np.zeros((height, width, 4), dtype=np.uint8)
+    qimage_to_array(image, bgra)
+    return bgra_to_nv12(bgra)
 
 
 def video_frame_to_rgb(frame: QVideoFrame) -> QImage:
@@ -116,6 +125,13 @@ def idle_decoder_status(use_gpu: bool) -> str:
 
 
 class Bus(QObject):
+    """One of the two picture sources, Program or Preview.
+
+    frame_np is the frame on show, as NV12. A video bus takes its frames from
+    its decoder in order, one per compositor tick, so the picture never skips
+    ahead and never repeats while the decoder keeps up.
+    """
+
     frame_ready = Signal()
     decoder_status_changed = Signal(str)
 
@@ -125,9 +141,7 @@ class Bus(QObject):
         self.path: Path | None = None
         self.process_w = 1920
         self.process_h = 1080
-        self.frame: QImage = black_frame(self.process_w, self.process_h)
-        self.frame_np = np.zeros((self.process_h, self.process_w, 4), dtype=np.uint8)
-        self.frame_np[..., 3] = 255
+        self.frame_np = black(self.process_w, self.process_h)
         self._content_serial = 0
         self.decoder_status = idle_decoder_status(True)
         self._frame_lock = threading.Lock()
@@ -160,8 +174,23 @@ class Bus(QObject):
         return bool(self.path and is_video(self.path))
 
     @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
     def capturing_first_frame(self) -> bool:
         return self._pause_after_first
+
+    def playing_frames(self) -> bool:
+        """True while this bus should hand on a new frame every tick."""
+        decoder = self._decoder
+        return (
+            decoder is not None
+            and not self._still
+            and not self._paused
+            and not self._pause_after_first
+            and decoder.frames_read > 0
+        )
 
     def current_serial(self) -> int:
         with self._frame_lock:
@@ -169,60 +198,42 @@ class Bus(QObject):
 
     def copy_array(self, dest: np.ndarray) -> int:
         with self._frame_lock:
-            serial = self._content_serial
-            src = self.frame_np
-            if src.shape != dest.shape:
-                dest.fill(0)
-                dest[..., 3] = 255
-                h = min(src.shape[0], dest.shape[0])
-                w = min(src.shape[1], dest.shape[1])
-                dest[:h, :w] = src[:h, :w]
-                return serial
-            np.copyto(dest, src)
-            return serial
+            copy_into(dest, self.frame_np)
+            return self._content_serial
 
     def take_frame(self, dest: np.ndarray, timeout: float = 0.0) -> int:
-        if self._decoder is not None and not self._still:
-            if self._decoder.pop_frame(dest, timeout):
-                dest[..., 3] = 255
+        return self.take_new_frame(dest, timeout)[0]
+
+    def take_new_frame(self, dest: np.ndarray, timeout: float = 0.0) -> tuple[int, bool]:
+        """Put the next frame on show and copy it into dest. (serial, was it new?)
+
+        A paused bus, a still, or a decoder that has nothing ready yet gives
+        the frame already on show. Frames are never skipped: the queue holds
+        them in order until they are taken.
+        """
+        decoder = self._decoder
+        if decoder is not None and not self._still and not self._paused and not self._pause_after_first:
+            if decoder.pop_frame(dest, timeout):
                 with self._frame_lock:
                     if self.frame_np.shape == dest.shape:
                         np.copyto(self.frame_np, dest)
+                    else:
+                        copy_into(self.frame_np, dest)
                     self._content_serial += 1
-                    return self._content_serial
-            return self.copy_array(dest)
-        return self.copy_array(dest)
+                    return self._content_serial, True
+        return self.copy_array(dest), False
 
     def _alloc_frame(self) -> None:
-        self.frame_np = np.zeros((self.process_h, self.process_w, 4), dtype=np.uint8)
-        self.frame_np[..., 3] = 255
-        self.frame = black_frame(self.process_w, self.process_h)
+        self.frame_np = black(self.process_w, self.process_h)
 
     def _publish_image(self, image: QImage) -> None:
         fitted = place_rgb(image, self.process_w, self.process_h, self._scale_mode)
+        frame = qimage_to_nv12(fitted, self.process_w, self.process_h)
         with self._frame_lock:
-            if self.frame_np.shape[0] != self.process_h or self.frame_np.shape[1] != self.process_w:
+            if self.frame_np.shape != frame.shape:
                 self._alloc_frame()
-            qimage_to_array(fitted, self.frame_np)
-            self.frame_np[..., 3] = 255
-            self.frame = fitted
+            np.copyto(self.frame_np, frame)
             self._content_serial += 1
-
-    def _publish_decoder_frame(self) -> bool:
-        if self._decoder is None:
-            return False
-        with self._frame_lock:
-            if not self._decoder.copy_frame(self.frame_np):
-                return False
-            self._content_serial += 1
-            self.frame = QImage(
-                self.frame_np.data,
-                self.process_w,
-                self.process_h,
-                int(self.frame_np.strides[0]),
-                QImage.Format.Format_RGB32,
-            )
-        return True
 
     def _set_decoder_status(self, status: str) -> None:
         if self.decoder_status == status:
@@ -249,7 +260,7 @@ class Bus(QObject):
         with self._frame_lock:
             self._alloc_frame()
         if self._still and self.path and is_image(self.path):
-            self._publish_image(QImage(str(self.path)))
+            self._publish_image(load_still(self.path, width, height, self._scale_mode))
             self.frame_ready.emit()
         elif self._decoder is not None:
             self._decoder.restart(width, height)
@@ -268,7 +279,7 @@ class Bus(QObject):
             return
         self._scale_mode = next_mode
         if self._still and self.path and is_image(self.path):
-            self._publish_image(QImage(str(self.path)))
+            self._publish_image(load_still(self.path, self.process_w, self.process_h, self._scale_mode))
             self.frame_ready.emit()
         elif self._decoder is not None:
             self._decoder.restart(scale_mode=self._scale_mode)
@@ -420,16 +431,16 @@ class Bus(QObject):
             decoder.status_changed.disconnect(self._on_decoder_status)
         except (RuntimeError, TypeError):
             pass
-        try:
-            decoder.status_changed.disconnect(self._set_decoder_status)
-        except (RuntimeError, TypeError):
-            pass
         self._decoder = None
         thread = decoder.stop()
 
         def _reap() -> None:
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=2.0)
+            # Delete the decoder only once its thread has ended. Until then the
+            # thread can still be inside a signal emit on it, and deleting a
+            # QObject under another thread's feet corrupts memory. The thread
+            # ends soon: stop() has killed its ffmpeg and closed its queue.
+            if thread is not None:
+                thread.join()
             decoder.deleteLater()
 
         threading.Thread(target=_reap, name="decoder-reap", daemon=True).start()
@@ -478,7 +489,7 @@ class Bus(QObject):
         except (RuntimeError, TypeError):
             pass
         self._decoder.set_paused(self._paused)
-        self._decoder.discard_queued()
+        # The queued frames are kept: they are what follows the frame on show.
         self._set_decoder_status(self._decoder.status)
 
     def adopt(self, other: Bus) -> None:
@@ -488,7 +499,6 @@ class Bus(QObject):
         self.path = other.path
         with self._frame_lock:
             other.copy_array(self.frame_np)
-            self.frame = other.frame.copy() if not other.frame.isNull() else black_frame(self.process_w, self.process_h)
         self._still = other._still
         self._player = other._player
         self._sink = other._sink
@@ -504,12 +514,12 @@ class Bus(QObject):
         self._full_frames = True
         self._convert_enabled = True
         self._apply_min_dt()
-        self._skip_frames = 3
         self._attach_qt()
         self._attach_decoder()
         if self._player is not None:
             self._player.play()
         if self._decoder is not None:
+            self._paused = False
             self._decoder.set_paused(False)
 
     def _detach_sources(self) -> None:
@@ -527,10 +537,6 @@ class Bus(QObject):
                 self._decoder.status_changed.disconnect(self._on_decoder_status)
             except (RuntimeError, TypeError):
                 pass
-            try:
-                self._decoder.status_changed.disconnect(self._set_decoder_status)
-            except (RuntimeError, TypeError):
-                pass
 
     def swap(self, other: Bus) -> None:
         self._detach_sources()
@@ -541,9 +547,9 @@ class Bus(QObject):
         self._sink, other._sink = other._sink, self._sink
         self._decoder, other._decoder = other._decoder, self._decoder
         self._paused, other._paused = other._paused, self._paused
+        self._pause_after_first, other._pause_after_first = other._pause_after_first, self._pause_after_first
         self.decoder_status, other.decoder_status = other.decoder_status, self.decoder_status
         with self._frame_lock, other._frame_lock:
-            self.frame, other.frame = other.frame, self.frame
             self.frame_np, other.frame_np = other.frame_np, self.frame_np
             self._content_serial, other._content_serial = other._content_serial, self._content_serial
             newest = max(self._content_serial, other._content_serial) + 1
@@ -555,8 +561,9 @@ class Bus(QObject):
         other._convert_enabled = True
         self._apply_min_dt()
         other._apply_min_dt()
-        self._skip_frames = 2
-        other._skip_frames = 2
+        # Only the Qt fallback player still skips its first frames after a swap.
+        self._skip_frames = 2 if self._player is not None else 0
+        other._skip_frames = 2 if other._player is not None else 0
         self._attach_qt()
         other._attach_qt()
         self._attach_decoder()
@@ -577,10 +584,13 @@ class Bus(QObject):
         return True
 
     def _after_publish(self) -> None:
-        self.frame_ready.emit()
+        # Pause before telling anyone. A listener that reacts to the first frame
+        # (a MIX that started while it was on its way) then sees the bus as it
+        # will stay, and can start it playing.
         if self._pause_after_first:
             self._pause_after_first = False
             self.set_paused(True)
+        self.frame_ready.emit()
 
     @Slot(str)
     def _on_decoder_status(self, status: str) -> None:
@@ -592,15 +602,18 @@ class Bus(QObject):
     def _on_hw_frame(self) -> None:
         if self.sender() is not self._decoder:
             return
-        if self._skip_frames > 0:
-            self._skip_frames -= 1
-            return
         if self._pause_after_first:
-            if self._decoder is not None:
+            # Take the clip's first frame off the front of the queue, so that
+            # playing later carries on with the second frame.
+            decoder = self._decoder
+            if decoder is not None:
                 with self._frame_lock:
-                    if self._decoder.copy_frame(self.frame_np):
+                    if decoder.pop_frame(self.frame_np, 0.0):
                         self._content_serial += 1
             self._after_publish()
+            return
+        if self._paused:
+            # Frames decoded ahead while nobody is taking them are not news.
             return
         self.frame_ready.emit()
 

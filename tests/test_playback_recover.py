@@ -12,7 +12,7 @@ from PySide6.QtCore import QCoreApplication
 
 from unittest import mock
 
-from media_background_pane import log
+from media_background_pane import hw_decoder, log
 from media_background_pane.engine import Engine
 from media_background_pane.hw_decoder import HwDecoder
 from media_background_pane.log import log_exception
@@ -55,7 +55,16 @@ class LogTests(unittest.TestCase):
         self.assertIn("compose", text)
 
 
-class EnqueueTests(unittest.TestCase):
+class QueueTests(unittest.TestCase):
+    """The decoder's frame queue since 5 Nov 2026.
+
+    It replaced the 1 Nov drop-oldest queue. A full queue makes the reader
+    wait again, which is what paces playback. That is safe now: the watchdog
+    restarts a dead compositor within a second, and stop() always releases
+    the reader. The 31 Oct freeze was a reader waiting forever on a full queue
+    with no compositor and nothing to start one.
+    """
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._app = QCoreApplication.instance() or QCoreApplication([])
@@ -64,25 +73,48 @@ class EnqueueTests(unittest.TestCase):
         decoder = HwDecoder("test")
         decoder._running = True
         decoder._paused = False
+        decoder._generation = 1
         return decoder
 
-    def test_full_queue_drops_oldest_without_blocking(self) -> None:
-        decoder = self._decoder()
-        frames = [np.full((2, 2, 4), value, dtype=np.uint8) for value in (1, 2, 3)]
+    def test_a_full_queue_holds_its_frames_in_order_and_stop_releases_the_reader(self) -> None:
+        frames = hw_decoder._Frames((2, 2), depth=2)
+        running = [True]
+        for value in (1, 2):
+            buffer = frames.take_free(lambda: running[0])
+            assert buffer is not None
+            buffer.fill(value)
+            self.assertTrue(frames.put(buffer))
+        waiting: list = []
+        reader = threading.Thread(target=lambda: waiting.append(frames.take_free(lambda: running[0])))
+        reader.start()
+        reader.join(0.3)
+        self.assertTrue(reader.is_alive())  # waiting, not dropping the oldest
+        first = frames.pop(0.0)
+        assert first is not None
+        self.assertEqual(int(first[0, 0]), 1)
+        frames.give_back(first)
+        reader.join(1.0)
+        self.assertFalse(reader.is_alive())
+        self.assertIsNotNone(waiting[0])
+        second = frames.pop(0.0)
+        assert second is not None
+        self.assertEqual(int(second[0, 0]), 2)
+        # A reader waiting on a full queue is let go at once when the clip stops.
+        frames.put(second)
+        frames.put(np.zeros((2, 2), np.uint8))
+        late: list = []
+        reader = threading.Thread(target=lambda: late.append(frames.take_free(lambda: running[0])))
+        reader.start()
+        time.sleep(0.1)
         started = time.perf_counter()
-        for frame in frames:
-            self.assertTrue(decoder._enqueue(frame))
-        elapsed = time.perf_counter() - started
-        self.assertLess(elapsed, 0.1)
-        dest = np.zeros((2, 2, 4), dtype=np.uint8)
-        self.assertTrue(decoder.pop_frame(dest))
-        self.assertEqual(int(dest[0, 0, 0]), 2)
-        self.assertTrue(decoder.pop_frame(dest))
-        self.assertEqual(int(dest[0, 0, 0]), 3)
+        frames.close()
+        reader.join(1.0)
+        self.assertFalse(reader.is_alive())
+        self.assertLess(time.perf_counter() - started, 0.5)
+        self.assertEqual(late, [None])
 
-    def test_stall_watch_kills_a_silent_decoder_and_spares_a_paused_one(self) -> None:
+    def test_stall_watch_kills_a_reader_stuck_on_ffmpeg_and_spares_one_waiting_for_frames_to_be_taken(self) -> None:
         decoder = self._decoder()
-        decoder._generation = 1
 
         class Proc:
             def __init__(self) -> None:
@@ -96,19 +128,19 @@ class EnqueueTests(unittest.TestCase):
 
         got = threading.Event()
         got.set()
+        stuck = hw_decoder._Frames((2, 2), depth=2)
+        stuck.reading_since = time.monotonic() - 30
         stalled = Proc()
-        decoder._watch_playback(stalled, 1, got, [time.monotonic() - 30])
+        decoder._watch_playback(stalled, 1, got, stuck)
         self.assertTrue(stalled.killed)
 
-        paused = Proc()
-        decoder._paused = True
-        thread = threading.Thread(
-            target=decoder._watch_playback,
-            args=(paused, 1, got, [time.monotonic() - 30]),
-        )
+        # Waiting for the compositor (or paused): reading_since is None.
+        waiting = hw_decoder._Frames((2, 2), depth=2)
+        spared = Proc()
+        thread = threading.Thread(target=decoder._watch_playback, args=(spared, 1, got, waiting))
         thread.start()
         time.sleep(0.6)
-        self.assertFalse(paused.killed)
+        self.assertFalse(spared.killed)
         decoder._running = False
         thread.join(1)
         self.assertFalse(thread.is_alive())

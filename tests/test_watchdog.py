@@ -20,9 +20,9 @@ from media_background_pane.engine import Engine
 class FakeSender:
     """Stands in for NdiSender. Nothing is sent on the network.
 
-    Keeps the top-left pixel of every picture that would have gone out over
-    NDI. FakeFfmpeg puts the frame number there, so it shows whether the
-    picture is moving.
+    Keeps the first byte (top-left luma) of every NV12 picture that would have
+    gone out over NDI. FakeFfmpeg puts the frame number there, so it shows
+    whether the picture is moving.
     """
 
     def __init__(self, name: str, fps: int, width: int = 0, height: int = 0) -> None:
@@ -33,7 +33,7 @@ class FakeSender:
 
     def submit_array(self, array) -> None:
         with self._lock:
-            self._pictures.append((time.monotonic(), int(array[0, 0, 0])))
+            self._pictures.append((time.monotonic(), int(array.reshape(-1)[0])))
 
     def since(self, start: float) -> list[int]:
         with self._lock:
@@ -288,7 +288,8 @@ class WatchdogTests(unittest.TestCase):
             decoder._proc.crash_with = SystemExit()
             old.join(2.0)
             self.assertFalse(old.is_alive())
-            self.assertTrue(run.frozen())
+            # The frames already decoded (about half a second) still play out.
+            self.assertTrue(run.wait_for(run.frozen, 3.0))
             found = engine.check_playback()
             self.assertEqual(found, ["the Program decoder had stopped (Holy Fire.mov); started it again"])
             self.assertIs(engine.program._decoder, decoder)

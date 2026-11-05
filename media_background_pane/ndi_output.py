@@ -11,9 +11,11 @@ import numpy as np
 from PySide6.QtGui import QImage
 
 from .config import OUTPUT_HEIGHT, OUTPUT_WIDTH
+from .frames import black, nv12_shape
 
 
 def qimage_to_array(image: QImage, dest: np.ndarray) -> None:
+    """Copy a QImage into a BGRA array of shape (height, width, 4)."""
     converted = image
     if converted.format() != QImage.Format.Format_RGB32:
         converted = converted.convertToFormat(QImage.Format.Format_RGB32)
@@ -35,6 +37,13 @@ def qimage_to_array(image: QImage, dest: np.ndarray) -> None:
 
 
 class NdiSender:
+    """Sends NV12 frames over NDI, without waiting for NDI to compress them.
+
+    NDI keeps reading a frame sent with send_send_video_async_v2 until the next
+    send. So each frame is copied into one of two buffers this object owns, and
+    a buffer is only reused, or replaced, once NDI has moved on to the other.
+    """
+
     def __init__(self, name: str, fps: int, width: int = OUTPUT_WIDTH, height: int = OUTPUT_HEIGHT) -> None:
         self.name = name
         self.fps = max(1, fps)
@@ -44,36 +53,41 @@ class NdiSender:
         self.status = "NDI runtime not found"
         self._send = None
         self._frame: Optional[ndi.VideoFrameV2] = None
-        self._staging = np.zeros((height, width, 4), dtype=np.uint8)
-        self._bufs = [
-            np.zeros((height, width, 4), dtype=np.uint8),
-            np.zeros((height, width, 4), dtype=np.uint8),
-        ]
+        self._bufs = [black(width, height), black(width, height)]
         self._buf_i = 0
         self._lock = threading.Lock()
-        self._dirty = False
-        self._running = False
-        self._thread: threading.Thread | None = None
         self._open()
 
     def _rate(self) -> tuple[int, int]:
         table = {24: (24, 1), 25: (25, 1), 30: (30000, 1000), 50: (50, 1), 60: (60000, 1000)}
         return table.get(self.fps, (self.fps, 1))
 
+    def _set_frame_fields(self) -> None:
+        # The ndi-python data setter sets xres, yres and line_stride_in_bytes
+        # from the array's shape. An NV12 array has 1.5x as many rows as the
+        # picture, so NDI would read past the end of the buffer: on 5 Nov 2026
+        # that crashed a test process. Set them again after every data =.
+        frame = self._frame
+        if frame is None:
+            return
+        frame.FourCC = ndi.FOURCC_VIDEO_TYPE_NV12
+        frame.xres = self.width
+        frame.yres = self.height
+        frame.line_stride_in_bytes = self.width
+
     def _configure_frame(self) -> None:
         if self._frame is None:
             return
         rate_n, rate_d = self._rate()
         self._frame.data = self._bufs[0]
-        self._frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRX
-        self._frame.xres = self.width
-        self._frame.yres = self.height
+        self._set_frame_fields()
         self._frame.frame_rate_N = rate_n
         self._frame.frame_rate_D = rate_d
-        self._frame.picture_aspect_ratio = 16.0 / 9.0
+        self._frame.picture_aspect_ratio = self.width / max(1, self.height)
         self._frame.frame_format_type = ndi.FRAME_FORMAT_TYPE_PROGRESSIVE
-        self._frame.line_stride_in_bytes = self.width * 4
-        self._frame.timecode = 0
+        # Let NDI stamp each frame with the time it was sent. A fixed 0 made
+        # every frame look alike to anything that orders frames by timecode.
+        self._frame.timecode = ndi.SEND_TIMECODE_SYNTHESIZE
 
     def _open(self) -> None:
         try:
@@ -96,21 +110,30 @@ class NdiSender:
         except OSError as exc:
             self.status = f"NDI error: {exc}"
 
+    def _flush(self) -> None:
+        """Wait until NDI has finished with the last frame. Call with the lock held."""
+        if self._send is None:
+            return
+        try:
+            ndi.send_send_video_async_v2(self._send, None)
+        except (OSError, TypeError):
+            pass
+
     def set_fps(self, fps: int) -> None:
-        self.fps = max(1, fps)
-        self._configure_frame()
+        with self._lock:
+            self.fps = max(1, fps)
+            self._flush()
+            self._configure_frame()
 
     def set_size(self, width: int, height: int) -> None:
         if width == self.width and height == self.height:
             return
         with self._lock:
+            # NDI may still be reading the old buffer; let it finish before it goes.
+            self._flush()
             self.width = width
             self.height = height
-            self._staging = np.zeros((height, width, 4), dtype=np.uint8)
-            self._bufs = [
-                np.zeros((height, width, 4), dtype=np.uint8),
-                np.zeros((height, width, 4), dtype=np.uint8),
-            ]
+            self._bufs = [black(width, height), black(width, height)]
             self._buf_i = 0
             self._configure_frame()
             self.status = f"NDI sending as {self.name} ({width}x{height})"
@@ -123,31 +146,24 @@ class NdiSender:
         except OSError:
             return 0
 
-    def submit(self, image: QImage) -> None:
-        if not self.available:
-            return
-        qimage_to_array(image, self._staging)
-        self.submit_array(self._staging)
-
     def submit_array(self, array: np.ndarray) -> None:
+        """Send one NV12 frame of the current size. Other sizes are skipped."""
         if not self.available or self._send is None or self._frame is None:
             return
         with self._lock:
-            if array.shape[0] != self.height or array.shape[1] != self.width:
+            if array.shape != nv12_shape(self.width, self.height):
                 return
-            np.copyto(self._bufs[self._buf_i], array)
             sendbuf = self._bufs[self._buf_i]
+            np.copyto(sendbuf, array)
             self._buf_i = 1 - self._buf_i
             self._frame.data = sendbuf
+            self._set_frame_fields()
             ndi.send_send_video_async_v2(self._send, self._frame)
 
     def close(self) -> None:
-        self._running = False
-        if self._send is not None:
-            try:
-                ndi.send_send_video_async_v2(self._send, None)
-            except (OSError, TypeError):
-                pass
-            ndi.send_destroy(self._send)
-            self._send = None
-        self.available = False
+        with self._lock:
+            if self._send is not None:
+                self._flush()
+                ndi.send_destroy(self._send)
+                self._send = None
+            self.available = False

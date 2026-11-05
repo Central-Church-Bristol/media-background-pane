@@ -30,7 +30,10 @@ SCALE_MODE_LABELS = (
     (SCALE_FIT, "Scale to Fit"),
     (SCALE_ACTUAL, "Actual Size"),
 )
-DEFAULTS_REVISION = 2
+# 2: 24 fps by default. 3 (5 Nov 2026): 1080p by default, now that the
+# pipeline manages it; a saved 540p, the old default, moves up once.
+DEFAULTS_REVISION = 3
+DEFAULT_QUALITY = "1080p"
 
 
 def app_data_dir() -> Path:
@@ -62,7 +65,7 @@ class Config:
         self.start_with_windows: bool = True
         self.auto_show_on_workspace: bool = True
         self.ndi_name: str = APP_NAME
-        self.quality: str = "540p"
+        self.quality: str = DEFAULT_QUALITY
         self.use_gpu_decode: bool = True
         self.thumb_scale: int = 112
         self.scale_mode: str = SCALE_FILL
@@ -73,7 +76,7 @@ class Config:
 
     @property
     def process_size(self) -> tuple[int, int]:
-        return QUALITY_SIZES.get(self.quality, QUALITY_SIZES["540p"])
+        return QUALITY_SIZES.get(self.quality, QUALITY_SIZES[DEFAULT_QUALITY])
 
     @property
     def fade_seconds(self) -> int:
@@ -111,12 +114,14 @@ class Config:
             if hasattr(self, key):
                 setattr(self, key, value)
         self.fade_index = FADE_DURATIONS.index(DEFAULT_FADE_SECONDS)
-        if incoming_rev < DEFAULTS_REVISION and int(self.fps) == 30:
+        if incoming_rev < 2 and int(self.fps) == 30:
             self.fps = 24
+        if incoming_rev < 3 and self.quality == "540p":
+            self.quality = DEFAULT_QUALITY
         if self.fps not in FPS_CHOICES:
             self.fps = 24
         if self.quality not in QUALITY_SIZES:
-            self.quality = "540p"
+            self.quality = DEFAULT_QUALITY
         self.use_gpu_decode = bool(self.use_gpu_decode)
         self.thumb_scale = max(64, min(200, int(self.thumb_scale or 112)))
         if self.scale_mode not in SCALE_MODES:

@@ -1,17 +1,32 @@
+"""How the decoder hands frames on (5 Nov 2026 design).
+
+The compositor is the only clock. The decoder keeps up to half a second of
+frames decoded ahead, in order, and waits when that queue is full. So:
+
+- playback speed is the compositor's rate, never ffmpeg's;
+- no frame is dropped or repeated while the decoder keeps up;
+- a pause carries on with the very next frame;
+- waiting for the compositor is never taken for a stalled ffmpeg.
+
+Before 5 Nov the decoder paced itself with its own clock and dropped the
+oldest frame when its 2-frame queue was full. That clock drifted against the
+compositor's, which showed as a frame repeated here and skipped there.
+"""
+
 import sys
 import threading
 import time
 import unittest
 from pathlib import Path
-from queue import Queue
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import QCoreApplication
 
 from media_background_pane import hw_decoder
+from media_background_pane.frames import nv12_shape
 from media_background_pane.hw_decoder import HwDecoder
 
 WIDTH, HEIGHT = 4, 2
@@ -20,8 +35,9 @@ WIDTH, HEIGHT = 4, 2
 class FakeFfmpeg:
     """An ffmpeg that always has the next frame ready, far faster than real time.
 
-    With hang_after set, reads block after that many frames, like a read from a
-    Google Drive file that has stopped answering. Only kill() releases them.
+    Every byte of frame n is n % 256. With hang_after set, reads block after
+    that many frames, like a read from a Google Drive file that has stopped
+    answering. Only kill() releases them.
     """
 
     def __init__(self, hang_after: int | None = None) -> None:
@@ -53,11 +69,7 @@ class FakeFfmpeg:
 
 
 class ReaderRun:
-    """Runs the real HwDecoder._play_mode loop against FakeFfmpeg.
-
-    Records when each frame is handed to the queue and how often frame_ready fires.
-    Nothing takes frames from the queue unless a test does.
-    """
+    """Runs the real HwDecoder reader loop against FakeFfmpeg. Tests take frames themselves."""
 
     def __init__(self, fps: int, proc: FakeFfmpeg | None = None) -> None:
         self.proc = proc or FakeFfmpeg()
@@ -65,49 +77,48 @@ class ReaderRun:
         decoder = self.decoder
         decoder._path = Path("clip.mp4")
         decoder._width, decoder._height, decoder._fps = WIDTH, HEIGHT, fps
-        decoder._queue = Queue(maxsize=2)
         decoder._running = True
         decoder._generation = 1
-        self.handed_on: list[float] = []
-        self.signals = 0
+        self.depth = hw_decoder.queue_depth(fps)
+        self.frames = hw_decoder._Frames(nv12_shape(WIDTH, HEIGHT), self.depth)
+        decoder._frames = self.frames
         self.result: bool | None = None
-        enqueue = decoder._enqueue
-
-        def recording_enqueue(frame: np.ndarray) -> bool:
-            self.handed_on.append(time.perf_counter())
-            return enqueue(frame)
-
-        decoder._enqueue = recording_enqueue
-        decoder.frame_ready.connect(self._count_signal, Qt.ConnectionType.DirectConnection)
         self._patches = [
             mock.patch.object(hw_decoder, "find_ffmpeg", return_value=Path("ffmpeg.exe")),
             mock.patch.object(hw_decoder, "_assign_job"),
             mock.patch.object(hw_decoder.subprocess, "Popen", return_value=self.proc),
         ]
         self.thread = threading.Thread(target=self._play, daemon=True)
-        self.started = 0.0
-
-    def _count_signal(self) -> None:
-        self.signals += 1
 
     def _play(self) -> None:
-        self.result = self.decoder._play_mode("software", 1)
+        self.result = self.decoder._play_mode("software", 1, self.frames)
 
     def __enter__(self) -> "ReaderRun":
         for patch in self._patches:
             patch.start()
-        self.started = time.perf_counter()
         self.thread.start()
         return self
 
     def __exit__(self, *exc_info) -> None:
-        self.decoder._running = False
+        self.decoder.stop()
         self.thread.join(2.0)
         for patch in reversed(self._patches):
             patch.stop()
 
-    def frames_between(self, start: float, end: float) -> int:
-        return sum(1 for t in list(self.handed_on) if start <= t < end)
+    def take(self, timeout: float = 0.5) -> int | None:
+        """The next frame's number, or None if none came."""
+        dest = np.zeros(nv12_shape(WIDTH, HEIGHT), dtype=np.uint8)
+        if not self.decoder.pop_frame(dest, timeout):
+            return None
+        return int(dest[0, 0])
+
+    def wait_for(self, condition, timeout: float = 2.0) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if condition():
+                return True
+            time.sleep(0.01)
+        return bool(condition())
 
 
 class PacingTests(unittest.TestCase):
@@ -115,86 +126,84 @@ class PacingTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls._app = QCoreApplication.instance() or QCoreApplication([])
 
-    def test_frames_are_handed_on_at_the_output_rate(self) -> None:
-        # The queue drops frames instead of blocking, so it no longer slows the
-        # reader. Without its own pacing the reader took frames as fast as
-        # ffmpeg decoded them and clips played fast: about 2.7x on Holy Fire.
-        fps = 40
-        with ReaderRun(fps) as run:
-            time.sleep(1.0)
-            end = time.perf_counter()
-        count = run.frames_between(run.started, end)
-        expected = 1 + fps * (end - run.started)
-        self.assertGreater(count, expected * 0.8)
-        self.assertLess(count, expected * 1.2)
-        gaps = np.diff(run.handed_on[1:])
-        self.assertAlmostEqual(float(np.median(gaps)), 1.0 / fps, delta=0.2 / fps)
-        # frame_ready still fires once per frame, so the GUI thread gets fps
-        # signals a second, not one per decoded frame.
-        self.assertLessEqual(abs(run.signals - len(run.handed_on)), 1)
-
-    def test_a_stalled_consumer_does_not_block_the_reader(self) -> None:
-        # Nothing takes frames, as when the compositor has died. The reader
-        # has to keep going at the same speed and drop old frames, so ffmpeg is
-        # never left blocked on a full pipe with the picture frozen.
-        fps = 50
-        with ReaderRun(fps) as run:
-            time.sleep(0.8)
-            alive = run.thread.is_alive()
-            count = len(run.handed_on)
-            queued = run.decoder._queue.qsize()
-        self.assertTrue(alive)
-        # A reader blocked on the full queue would stop at 3 frames.
-        self.assertGreater(count, 0.8 * fps * 0.7)
-        self.assertLess(count, (1 + 0.8 * fps) * 1.2)
-        self.assertLessEqual(queued, 2)
-        latest = run.decoder._latest
-        assert latest is not None
-        self.assertEqual(int(latest[0, 0, 0]), run.proc.frames % 256)
-
-    def test_resuming_after_a_pause_does_not_rush_to_catch_up(self) -> None:
-        fps = 40
-        with ReaderRun(fps) as run:
+    def test_the_reader_fills_the_queue_then_waits(self) -> None:
+        # Nothing takes frames, as when Preview is paused or the compositor has
+        # died. The reader decodes half a second ahead and then waits; ffmpeg
+        # waits on the pipe behind it. Nothing is dropped.
+        with ReaderRun(fps=24) as run:
+            self.assertTrue(run.wait_for(lambda: run.decoder.frames_read >= run.depth))
             time.sleep(0.3)
+            self.assertEqual(run.decoder.frames_read, run.depth)
+            self.assertEqual(run.proc.frames, run.depth)
+            self.assertEqual(run.decoder.queued(), run.depth)
+            self.assertTrue(run.thread.is_alive())
+            # The first frame decoded is the first frame handed on.
+            self.assertEqual(run.take(), 1)
+
+    def test_frames_come_out_in_order_with_none_skipped(self) -> None:
+        with ReaderRun(fps=30) as run:
+            taken = [run.take() for _ in range(300)]
+        self.assertEqual(taken, [n % 256 for n in range(1, 301)])
+
+    def test_playback_speed_is_set_by_whoever_takes_the_frames(self) -> None:
+        # FakeFfmpeg could deliver thousands of frames a second. The reader
+        # reads only as fast as frames are taken, plus the queue it keeps.
+        rate = 40
+        with ReaderRun(fps=24) as run:
+            self.assertTrue(run.wait_for(lambda: run.decoder.queued() == run.depth))
+            taken = 0
+            start = time.perf_counter()
+            while time.perf_counter() - start < 1.0:
+                self.assertIsNotNone(run.take())
+                taken += 1
+                time.sleep(1.0 / rate)
+            self.assertTrue(run.wait_for(lambda: run.decoder.queued() == run.depth))
+            read = run.decoder.frames_read
+        self.assertGreater(taken, rate * 0.7)
+        self.assertLessEqual(abs(read - (taken + run.depth)), 1)
+
+    def test_a_pause_carries_on_with_the_next_frame(self) -> None:
+        with ReaderRun(fps=24) as run:
+            seen = [run.take() for _ in range(5)]
             run.decoder.set_paused(True)
-            paused_at = time.perf_counter()
-            time.sleep(0.6)
-            resumed_at = time.perf_counter()
+            time.sleep(0.5)  # nobody takes frames; the reader tops the queue up and waits
+            read_while_paused = run.decoder.frames_read
+            time.sleep(0.3)
+            self.assertEqual(run.decoder.frames_read, read_while_paused)
             run.decoder.set_paused(False)
-            time.sleep(0.5)
-            end = time.perf_counter()
-        # One frame may already be on its way when the pause lands.
-        self.assertEqual(run.frames_between(paused_at + 2.0 / fps, resumed_at), 0)
-        after = run.frames_between(resumed_at, end)
-        expected = 1 + fps * (end - resumed_at)
-        # Catching up on the 0.6 s spent paused would add another 24 frames.
-        self.assertGreater(after, expected * 0.7)
-        self.assertLess(after, expected * 1.2)
+            after = [run.take() for _ in range(5)]
+        self.assertEqual(seen, [1, 2, 3, 4, 5])
+        # Not a jump ahead to what ffmpeg reached, and not a rush to catch up.
+        self.assertEqual(after, [6, 7, 8, 9, 10])
 
-    def test_watchdog_spares_a_paced_reader_and_still_kills_a_hung_one(self) -> None:
-        # At a low output rate the reader waits a long time between frames.
-        # That wait is one frame interval. The real _STALL_TIMEOUT is 8 s and
-        # the slowest rate is 1 fps, so the watchdog must never take it for a
-        # stall. A smaller timeout here keeps the test short.
-        with mock.patch.object(hw_decoder, "_STALL_TIMEOUT", 0.6):
-            with ReaderRun(fps=5) as run:
-                time.sleep(1.6)
-                killed = run.proc.killed
-                count = len(run.handed_on)
-        self.assertFalse(killed)
-        self.assertGreaterEqual(count, 7)
+    def test_stop_releases_a_reader_waiting_on_a_full_queue(self) -> None:
+        run = ReaderRun(fps=24)
+        with run:
+            self.assertTrue(run.wait_for(lambda: run.decoder.queued() == run.depth))
+            started = time.perf_counter()
+            run.decoder.stop()
+            run.thread.join(1.0)
+            self.assertFalse(run.thread.is_alive())
+            self.assertLess(time.perf_counter() - started, 0.5)
 
-        # A read that hangs after frames have been flowing (Drive dropping out)
-        # still gets ffmpeg killed so the clip can be opened again.
-        # Only the watchdog can release the hung read while the run is still on.
+    def test_waiting_for_the_compositor_is_not_a_stall_but_a_hung_ffmpeg_is(self) -> None:
+        # The real _STALL_TIMEOUT is 8 s. A smaller one keeps the test short.
         with mock.patch.object(hw_decoder, "_STALL_TIMEOUT", 0.5):
-            with ReaderRun(fps=25, proc=FakeFfmpeg(hang_after=5)) as run:
+            with ReaderRun(fps=24) as run:
+                time.sleep(1.5)  # queue full, nobody taking frames
+                killed = run.proc.killed
+                self.assertEqual(run.decoder.frames_read, run.depth)
+            self.assertFalse(killed)
+
+            # A read that hangs after frames have been flowing (Drive dropping
+            # out) still gets ffmpeg killed so the clip can be opened again.
+            with ReaderRun(fps=24, proc=FakeFfmpeg(hang_after=5)) as run:
                 run.thread.join(3.0)
                 finished = not run.thread.is_alive()
                 killed = run.proc.killed
-        self.assertTrue(killed)
-        self.assertTrue(finished)
-        self.assertTrue(run.result)
+            self.assertTrue(killed)
+            self.assertTrue(finished)
+            self.assertTrue(run.result)
 
 
 if __name__ == "__main__":

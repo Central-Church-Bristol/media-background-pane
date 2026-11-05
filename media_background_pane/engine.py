@@ -4,15 +4,16 @@ import threading
 import time
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QImage
 
 from .bus import Bus, idle_decoder_status
 from .config import GUI_FPS, GUI_HEIGHT, GUI_WIDTH, SCALE_FILL, SCALE_MODES, Config
+from .frames import Mixer, black, frame_size, nv12_to_bgra
 from .hw_decoder import warmup_ffmpeg
 from .log import log_event, log_exception, thread_stack
 from .ndi_output import NdiSender
-from .timing import sleep_until
+from .timing import raise_thread_priority, sleep_until
 
 # The watchdog runs on the GUI thread, outside the threads it watches. On
 # 2 Nov 2026 the compose and Program decoder threads ended and nothing
@@ -28,107 +29,27 @@ _DECODER_STUCK = 30.0
 # A longer gap between two checks means the PC was asleep or the GUI thread
 # was blocked. Times measured across it mean nothing, so measure again.
 _CHECK_GAP = 5.0
+# How long the compositor waits for a playing bus's next frame. The decoder
+# keeps half a second queued, so normally the frame is already there.
+_FRAME_WAIT = 0.005
+# Ticks where a playing bus had no new frame are counted and logged at most
+# this often, so a service leaves a trace of any stutter without a flood.
+_LATE_REPORT_INTERVAL = 60.0
 
 
-def _scale_gui(image: QImage) -> QImage:
-    if image.isNull():
-        return image
-    return image.scaled(
-        GUI_WIDTH,
-        GUI_HEIGHT,
-        Qt.AspectRatioMode.KeepAspectRatio,
-        Qt.TransformationMode.FastTransformation,
-    )
+def _gui_size(width: int, height: int) -> tuple[int, int]:
+    scale = min(GUI_WIDTH / max(1, width), GUI_HEIGHT / max(1, height))
+    return max(2, int(round(width * scale))), max(2, int(round(height * scale)))
 
 
 def _scale_gui_array(array: np.ndarray) -> QImage:
+    """A small RGB32 copy of an NV12 frame, for the monitors and the iPad remote."""
     if array.size == 0:
         return QImage()
-    wrapper = QImage(
-        array.data,
-        int(array.shape[1]),
-        int(array.shape[0]),
-        int(array.strides[0]),
-        QImage.Format.Format_RGB32,
-    )
-    if wrapper.isNull():
-        return wrapper
-    return _scale_gui(wrapper).copy()
-
-
-def _opaque_black(dest: np.ndarray) -> np.ndarray:
-    dest[..., :3] = 0
-    dest[..., 3] = 255
-    return dest
-
-
-# Natural vignetting ≈ cos⁴(θ) ≈ 1/(1+r²)² (cosine-fourth / Kino).
-# Cosine develops until fade progress 0.8, then that shape holds and the
-# whole frame eases to black so the hotspot never pinches to a dot.
-# Radius is shaped so the middle stays open while edges crush.
-# Exposure only — chromaticity is left alone.
-_VIGNETTE_LIMIT = 0.8
-_VIGNETTE_STRENGTH = 2.6
-_VIGNETTE_RADIUS = 1.85
-_VIGNETTE_GAMMA = 0.5
-
-
-def _vignette_r2(height: int, width: int) -> np.ndarray:
-    aspect = width / max(1, height)
-    ys = ((np.arange(height, dtype=np.float32) + 0.5) / height - 0.5) * 2.0
-    xs = ((np.arange(width, dtype=np.float32) + 0.5) / width - 0.5) * 2.0 * aspect
-    return xs[np.newaxis, :] ** 2 + ys[:, np.newaxis] ** 2
-
-
-def _smoothstep(edge0: float, edge1: float, x: float) -> float:
-    t = min(1.0, max(0.0, (x - edge0) / (edge1 - edge0)))
-    return t * t * (3.0 - 2.0 * t)
-
-
-def _apply_vignette_dim(frame: np.ndarray, dimmer: float, r2: np.ndarray) -> np.ndarray:
-    if dimmer <= 0.001:
-        return _opaque_black(np.empty_like(frame))
-    if dimmer >= 0.999:
-        return frame
-    progress = 1.0 - dimmer
-    vig = min(1.0, progress / _VIGNETTE_LIMIT) ** _VIGNETTE_GAMMA
-    falloff = vig * _VIGNETTE_STRENGTH
-    rf2 = np.power(r2, _VIGNETTE_RADIUS / 2.0) * (falloff * falloff)
-    cosine = 1.0 / np.square(rf2 + 1.0)
-    shade = cosine
-    tail = 1.0 - _smoothstep(_VIGNETTE_LIMIT - 0.04, 1.0, progress)
-    rgb = frame[..., :3].astype(np.float32) * (1.0 / 255.0)
-    lin = np.square(rgb)
-    lin *= shade[..., None]
-    lin *= tail
-    dimmed = np.empty_like(frame)
-    dimmed[..., :3] = (np.sqrt(np.clip(lin, 0.0, 1.0)) * 255.0).astype(np.uint8)
-    dimmed[..., 3] = 255
-    return dimmed
-
-
-def _blend(
-    program: np.ndarray,
-    preview: np.ndarray,
-    mix: float,
-    dimmer: float,
-    r2: np.ndarray,
-) -> np.ndarray:
-    if dimmer <= 0.001:
-        return _opaque_black(np.empty_like(program))
-    if mix <= 0.001:
-        out = program
-    elif mix >= 0.999:
-        out = preview
-    else:
-        weight = np.uint16(round(mix * 256))
-        inv = np.uint16(256 - int(weight))
-        out = ((program.astype(np.uint16) * inv + preview.astype(np.uint16) * weight) >> 8).astype(
-            np.uint8
-        )
-    if dimmer < 0.999:
-        return _apply_vignette_dim(out, dimmer, r2)
-    return out
+    width, height = _gui_size(*frame_size(array))
+    bgra = nv12_to_bgra(array, width, height)
+    image = QImage(bgra.data, width, height, width * 4, QImage.Format.Format_RGB32)
+    return image.copy()
 
 
 class Engine(QObject):
@@ -157,11 +78,9 @@ class Engine(QObject):
         self.program.set_scale_mode(config.scale_mode)
         self.mix = 0.0
         self.dimmer = 1.0
-        self._pgm_np = np.zeros((height, width, 4), dtype=np.uint8)
-        self._pvw_np = np.zeros((height, width, 4), dtype=np.uint8)
-        self._black_np = np.zeros((height, width, 4), dtype=np.uint8)
-        _opaque_black(self._black_np)
-        self._vignette_r2 = _vignette_r2(height, width)
+        self._mixer = Mixer(width, height)
+        self._pgm_np = black(width, height)
+        self._pvw_np = black(width, height)
         self._sender = NdiSender(config.ndi_name, config.fps, width, height)
         self._gui_enabled = True
         self._taking = False
@@ -180,6 +99,9 @@ class Engine(QObject):
         self._watched_ticks_since = 0.0
         self._compose_stuck_reported = False
         self._last_check: float | None = None
+        # Ticks where a playing bus had no new frame ready, since late_since.
+        self.late_frames = {"program": 0, "preview": 0}
+        self._late_since = time.monotonic()
         self.program.frame_ready.connect(self._on_program_frame)
         self.preview.frame_ready.connect(self._on_preview_frame)
         self.program.decoder_status_changed.connect(self._on_decoder_status)
@@ -231,7 +153,7 @@ class Engine(QObject):
         return image
 
     def _submit_opaque_black(self) -> None:
-        self._sender.submit_array(self._black_np)
+        self._sender.submit_array(self._mixer.black)
         if self._gui_enabled:
             self.program_changed.emit(self._gui_black())
 
@@ -242,9 +164,9 @@ class Engine(QObject):
         with self._compose_lock:
             self._compose_unlocked()
 
-    def _set_playback_blackout(self, black: bool) -> None:
-        self.program.set_paused(black)
-        if black:
+    def _set_playback_blackout(self, black_out: bool) -> None:
+        self.program.set_paused(black_out)
+        if black_out:
             self.program.set_convert_enabled(False)
             if not self.preview.capturing_first_frame:
                 self.preview.set_paused(True)
@@ -287,11 +209,9 @@ class Engine(QObject):
         with self._compose_lock:
             self.preview.set_process_size(width, height)
             self.program.set_process_size(width, height)
-            self._pgm_np = np.zeros((height, width, 4), dtype=np.uint8)
-            self._pvw_np = np.zeros((height, width, 4), dtype=np.uint8)
-            self._black_np = np.zeros((height, width, 4), dtype=np.uint8)
-            _opaque_black(self._black_np)
-            self._vignette_r2 = _vignette_r2(height, width)
+            self._mixer = Mixer(width, height)
+            self._pgm_np = black(width, height)
+            self._pvw_np = black(width, height)
             self._sender.set_size(width, height)
         self.ndi_status_changed.emit(self._sender.status, self._sender.available)
         self._wake_compose()
@@ -381,7 +301,7 @@ class Engine(QObject):
             if not self._compose_running:
                 return False
             current = self._compose_thread
-            if current is not None and current.is_alive():
+            if current is not None and _thread_alive(current):
                 return False
             thread = threading.Thread(target=self._compose_thread_main, name="compose", daemon=True)
             self._compose_thread = thread
@@ -390,6 +310,8 @@ class Engine(QObject):
 
     def _compose_thread_main(self) -> None:
         try:
+            # Its timing is the output's timing, and it needs only a few ms a frame.
+            raise_thread_priority()
             self._compose_run()
         except BaseException as exc:
             log_exception("compose thread", exc)
@@ -420,7 +342,7 @@ class Engine(QObject):
 
         Runs every second on the GUI thread, so it keeps working when those
         threads die. Returns what it found; each line is also written to the
-        session log.
+        session log. A failure in one check does not skip the others.
         """
         if now is None:
             now = time.monotonic()
@@ -428,9 +350,16 @@ class Engine(QObject):
         self._last_check = now
         found: list[str] = []
         if self._compose_running:
-            found += self._check_compose(now, judge)
+            try:
+                found += self._check_compose(now, judge)
+            except Exception as exc:
+                log_exception("watchdog compositor check", exc)
             for bus in (self.program, self.preview):
-                line = bus.check_decoder(now, _DECODER_STUCK, judge)
+                try:
+                    line = bus.check_decoder(now, _DECODER_STUCK, judge)
+                except Exception as exc:
+                    log_exception(f"watchdog {bus.name} check", exc)
+                    line = None
                 if line:
                     found.append(line)
         for line in found:
@@ -439,7 +368,7 @@ class Engine(QObject):
 
     def _check_compose(self, now: float, judge: bool) -> list[str]:
         thread = self._compose_thread
-        if thread is None or not thread.is_alive():
+        if thread is None or not _thread_alive(thread):
             if not self._start_compose_thread():
                 return []
             self._watched_ticks = -1
@@ -460,6 +389,8 @@ class Engine(QObject):
         ]
 
     def _compose_run(self) -> None:
+        # The only clock in playback. Each tick takes one frame from each
+        # playing bus, so the clips play at the output rate exactly.
         next_t = time.perf_counter()
         while self._compose_running:
             self._compose_ticks += 1
@@ -489,24 +420,43 @@ class Engine(QObject):
         self._gui_n = 0
         return True
 
+    def _take(self, bus: Bus, dest: np.ndarray) -> int:
+        """Take bus's next frame into dest, counting a tick it had none ready."""
+        playing = bus.playing_frames()
+        serial, new = bus.take_new_frame(dest, _FRAME_WAIT if playing else 0.0)
+        if playing and not new:
+            self.late_frames[bus.name] += 1
+        return serial
+
+    def _report_late_frames(self) -> None:
+        now = time.monotonic()
+        if now - self._late_since < _LATE_REPORT_INTERVAL:
+            return
+        program, preview = self.late_frames["program"], self.late_frames["preview"]
+        if program or preview:
+            log_event(
+                "compose",
+                f"no new frame ready in time: Program {program}, Preview {preview} "
+                f"times in the last {now - self._late_since:.0f} s",
+            )
+        self.late_frames = {"program": 0, "preview": 0}
+        self._late_since = now
+
     def _compose_unlocked(self) -> None:
         if not self._compose_running or self._taking:
             return
         mix = self.mix
         dimmer = self.dimmer
+        mixer = self._mixer
         emit_gui = self._emit_gui()
         if dimmer <= 0.001:
-            self._sender.submit_array(self._black_np)
+            self._sender.submit_array(mixer.black)
             if emit_gui:
                 self.program_changed.emit(self._gui_black())
             return
-        wait = 0.008 if self.program.is_video else 0.0
-        self.program.take_frame(self._pgm_np, timeout=wait)
+        self._take(self.program, self._pgm_np)
         if mix <= 0.001:
-            if dimmer >= 0.999:
-                shown = self._pgm_np
-            else:
-                shown = _blend(self._pgm_np, self._pgm_np, 0.0, dimmer, self._vignette_r2)
+            shown = mixer.dim(self._pgm_np, dimmer)
             self._sender.submit_array(shown)
             if emit_gui:
                 self.program_changed.emit(_scale_gui_array(shown))
@@ -514,13 +464,16 @@ class Engine(QObject):
                 self._preview_gui_dirty = False
                 serial = self.preview.copy_array(self._pvw_np)
                 self._post_preview(_scale_gui_array(self._pvw_np), serial)
+            self._report_late_frames()
             return
-        serial = self.preview.take_frame(self._pvw_np, timeout=0.0)
-        mixed = _blend(self._pgm_np, self._pvw_np, mix, dimmer, self._vignette_r2)
-        self._sender.submit_array(mixed)
+        serial = self._take(self.preview, self._pvw_np)
+        mixed = self._pvw_np if mix >= 0.999 else mixer.blend(self._pgm_np, self._pvw_np, mix)
+        shown = mixer.dim(mixed, dimmer)
+        self._sender.submit_array(shown)
         if emit_gui:
-            self.program_changed.emit(_scale_gui_array(mixed))
+            self.program_changed.emit(_scale_gui_array(shown))
             self._post_preview(_scale_gui_array(self._pvw_np), serial)
+        self._report_late_frames()
 
     @Slot()
     def _on_program_frame(self) -> None:
@@ -556,6 +509,10 @@ class Engine(QObject):
         if self.mix <= 0.001:
             self._emit_preview_frame()
             return
+        if not self._blacked_out() and self.preview.paused:
+            # MIX started while the clip's first frame was on its way, and
+            # the bus paused itself after it. Mixing needs it playing.
+            self._sync_preview_convert()
         self._preview_gui_dirty = True
         self._wake_compose()
 
@@ -575,3 +532,14 @@ class Engine(QObject):
         self.preview.clear()
         self.program.clear()
         self._sender.close()
+
+
+def _thread_alive(thread: threading.Thread) -> bool:
+    try:
+        return thread.is_alive()
+    except Exception:
+        # 5 Nov 2026: in the running pane, is_alive() on the live compose
+        # thread raised "Thread.__init__() not called" every second, and the
+        # watchdog stopped there. Say "alive": the tick count still catches a
+        # compositor that has stopped moving.
+        return True

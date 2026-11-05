@@ -13,7 +13,10 @@ from .config import APP_NAME
 # garbage collection can run a __del__ that raises in the middle of a write.
 _lock = threading.RLock()
 _last_written: dict[str, float] = {}
+# Per repeating error: [current interval, repeats not yet written, when the first of those came].
+_repeats: dict[str, list] = {}
 _LOG_INTERVAL = 5.0
+_MAX_INTERVAL = 600.0
 _MAX_BYTES = 512_000
 # Entries that reached no file at all. They are kept here, up to a limit, and
 # written with the next entry that gets through, so a gap loses nothing.
@@ -53,6 +56,12 @@ def log_event(context: str, message: str, *, path: Path | None = None) -> None:
 def log_exception(context: str, exc: BaseException | None = None, *, path: Path | None = None) -> None:
     """Append one traceback to the session log. Repeated errors are throttled.
 
+    The same error from the same place is written at most once per interval.
+    While it keeps coming, the interval doubles each time, from 5 s up to
+    10 minutes, and each entry says how many repeats it stands for. On 5 Nov
+    2026 one error repeating every second filled the log and its one older
+    file within an hour, and pushed out what had happened before.
+
     Never raises. It runs inside the handlers that keep threads alive. If it
     raised there, the thread would end, and under pythonw nothing would say why.
     """
@@ -65,10 +74,27 @@ def log_exception(context: str, exc: BaseException | None = None, *, path: Path 
         now = time.monotonic()
         with _lock:
             last = _last_written.get(key)
-            if last is not None and now - last < _LOG_INTERVAL:
+            if last is None:
+                _repeats.pop(key, None)
+            state = _repeats.get(key)
+            interval = state[0] if state else _LOG_INTERVAL
+            if last is not None and now - last < interval:
+                if state is None:
+                    state = _repeats[key] = [interval, 0, ""]
+                if state[1] == 0:
+                    state[2] = _stamp()
+                state[1] += 1
                 return
+            header = context
+            if state is not None and state[1]:
+                times = "time" if state[1] == 1 else "times"
+                header += f" (the same error {state[1]} more {times} since {state[2]})"
+                state[0] = min(_MAX_INTERVAL, state[0] * 2)
+                state[1] = 0
+            elif state is not None:
+                state[0] = _LOG_INTERVAL
             _last_written[key] = now
-            _write(f"{_stamp()} {context}\n{_format(exc)}\n", path)
+            _write(f"{_stamp()} {header}\n{_format(exc)}\n", path)
     except Exception:
         pass
 
