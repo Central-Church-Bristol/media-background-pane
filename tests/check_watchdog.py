@@ -54,7 +54,8 @@ class PictureRecorder:
         self._seen: list[tuple[float, int]] = []
 
     def submit_array(self, array) -> None:
-        key = hash(array[::16, ::16, :3].tobytes())
+        # NV12 since 5 Nov 2026: one byte plane, luma on top.
+        key = hash(array.reshape(array.shape[0], -1)[::16, ::16].tobytes())
         with self._lock:
             self._seen.append((time.monotonic(), key))
 
@@ -221,11 +222,11 @@ def program_decoder_ends(run: Run) -> None:
     old = decoder._thread
     before = len(run.log_lines())
 
-    def crash_once(proc, size):
-        del decoder._read_exact
+    def crash_once(proc, buffer):
+        del decoder._read_into
         raise SystemExit()
 
-    decoder._read_exact = crash_once
+    decoder._read_into = crash_once
     ended = time.monotonic()
     old.join(3.0)
     gap = run.freeze_after(ended, 8.0)

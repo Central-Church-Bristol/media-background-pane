@@ -6,14 +6,16 @@ per output tick, the way Engine._compose_run does for a video on Program.
 
 For each decode mode it reports:
 
-- frames per second read from ffmpeg. The ffmpeg command ends in fps=<output fps>,
+- frames per second read from ffmpeg. The ffmpeg command starts with fps=<output fps>,
   so each frame is 1/<output fps> of a second of the clip. That makes
   read rate / output fps the playback speed (1.00x = real time).
 - how often the compositor had no new frame (showed one twice) or skipped frames.
 - CPU used by ffmpeg and by this script.
 
-It also checks two more things. A compositor that stops taking frames must not
-block the decoder. Resuming after a pause must not race to catch up.
+Since 5 Nov 2026 the compositor is the only clock: the decoder keeps a short
+queue full and waits. So it also checks two more things. With nobody taking
+frames, the decoder fills its queue and waits, ffmpeg is not killed, and the
+frames then come out in order. Resuming after a pause must not race to catch up.
 
 It opens no window, no NDI source and not the single-instance lock. That makes it
 safe to run while Media Background Pane is open. It is not one of the unit tests
@@ -40,11 +42,12 @@ import numpy as np
 from PySide6.QtCore import QCoreApplication
 
 from media_background_pane import hw_decoder
-from media_background_pane.hw_decoder import HwDecoder, find_ffmpeg
+from media_background_pane.frames import nv12_shape
+from media_background_pane.hw_decoder import HwDecoder, find_ffmpeg, queue_depth
 from media_background_pane.timing import begin_precise_timer, end_precise_timer, sleep_until
 
 DEFAULT_CLIP = ROOT / "vendor" / "ffmpeg" / "testsrc.mp4"
-MODES = ("software", "gpu", "gpu-d3d11")
+MODES = ("software", "gpu")
 WARMUP = 1.0
 # Inside this band the clip plays at real time. Timer jitter alone stays well inside it.
 SPEED_OK = (0.95, 1.05)
@@ -82,35 +85,40 @@ class CountingDecoder(HwDecoder):
         self.mode = mode
         self.read_times: list[float] = []
 
-    def _run_attempts(self, generation: int) -> bool:
+    def _run_attempts(self, generation: int, frames) -> bool:
         if not self._running or generation != self._generation:
             return False
-        self._play_mode(self.mode, generation)
+        self._play_mode(self.mode, generation, frames)
         return self._running and generation == self._generation
 
-    def _enqueue(self, frame: np.ndarray) -> bool:
-        # _play_mode hands every frame it reads to _enqueue exactly once.
-        # Write the frame number into the first pixel so the compositor can tell
-        # which frame it was given.
+    def _read_into(self, proc, buffer: np.ndarray) -> bool:
+        # Every frame read from ffmpeg passes through here exactly once.
+        # Write its number into the first three luma bytes, so the compositor
+        # can tell which frame it was given.
+        if not super()._read_into(proc, buffer):
+            return False
         seq = len(self.read_times) + 1
-        frame[0, 0, 0] = seq & 0xFF
-        frame[0, 0, 1] = (seq >> 8) & 0xFF
-        frame[0, 0, 2] = (seq >> 16) & 0xFF
+        buffer[0, 0] = seq & 0xFF
+        buffer[0, 1] = (seq >> 8) & 0xFF
+        buffer[0, 2] = (seq >> 16) & 0xFF
         self.read_times.append(time.perf_counter())
-        return super()._enqueue(frame)
+        return True
 
     def reads_between(self, start: float, end: float) -> int:
         return sum(1 for t in list(self.read_times) if start <= t < end)
 
 
 class Compositor(threading.Thread):
-    """Takes one frame per output tick, like Engine._compose_run with a clip on Program."""
+    """Takes one frame per output tick, like Engine._compose_run with a clip on Program.
+
+    Like Bus, it takes nothing while the decoder is paused.
+    """
 
     def __init__(self, decoder: HwDecoder, fps: int, width: int, height: int) -> None:
         super().__init__(name="check-compose", daemon=True)
         self.decoder = decoder
         self.fps = fps
-        self.dest = np.zeros((height, width, 4), dtype=np.uint8)
+        self.dest = np.zeros(nv12_shape(width, height), dtype=np.uint8)
         self.ticks: list[tuple[float, int | None]] = []
         self.running = True
 
@@ -123,9 +131,9 @@ class Compositor(threading.Thread):
                 break
             # Same wait the engine uses for a video on Program.
             seq = None
-            if self.decoder.pop_frame(self.dest, timeout=0.008):
+            if not self.decoder.paused and self.decoder.pop_frame(self.dest, timeout=0.005):
                 d = self.dest
-                seq = int(d[0, 0, 0]) | (int(d[0, 0, 1]) << 8) | (int(d[0, 0, 2]) << 16)
+                seq = int(d[0, 0]) | (int(d[0, 1]) << 8) | (int(d[0, 2]) << 16)
             self.ticks.append((time.perf_counter(), seq))
             next_t += interval
             now = time.perf_counter()
@@ -229,19 +237,30 @@ def measure_playback(
 
 def measure_stalled_consumer(
     mode: str, clip: Path, fps: int, width: int, height: int, seconds: float
-) -> float | None:
-    """Frames per second the decoder keeps reading when nothing takes frames from it."""
+) -> tuple[int, bool, list[int | None]] | None:
+    """Nothing takes frames for `seconds`, then a compositor starts.
+
+    Returns (frames read in that time, was ffmpeg still running at the end,
+    the first frame numbers the compositor then got).
+    """
     decoder = _start(mode, clip, fps, width, height)
     if decoder is None:
         return None
     try:
-        time.sleep(WARMUP)
         t0 = time.perf_counter()
         time.sleep(seconds)
-        t1 = time.perf_counter()
+        read = decoder.reads_between(0.0, time.perf_counter())
+        proc = decoder._proc
+        alive = proc is not None and proc.poll() is None
+        compositor = Compositor(decoder, fps, width, height)
+        compositor.start()
+        time.sleep(1.0)
+        compositor.running = False
+        compositor.join(1.0)
     finally:
         _stop(decoder)
-    return decoder.reads_between(t0, t1) / (t1 - t0)
+    del t0
+    return read, alive, [seq for _t, seq in compositor.ticks[:fps]]
 
 
 def measure_pause_resume(
@@ -288,7 +307,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--clip", type=Path, default=DEFAULT_CLIP, help="video to loop (default: vendor/ffmpeg/testsrc.mp4)")
     parser.add_argument("--fps", type=int, default=24, help="output fps (the app default is 24)")
-    parser.add_argument("--size", default="960x540", help="output size (the app default, 540p, is 960x540)")
+    parser.add_argument("--size", default="1920x1080", help="output size (the app default, 1080p, is 1920x1080)")
     parser.add_argument("--seconds", type=float, default=5.0, help="length of each measurement")
     parser.add_argument("--modes", default=",".join(MODES), help="decode modes to try")
     parser.add_argument("--quick", action="store_true", help="only measure playback speed")
@@ -302,10 +321,6 @@ def main() -> int:
     if not args.clip.is_file():
         print(f"clip not found: {args.clip}")
         return 2
-    if "gpu-d3d11" in modes and not hw_decoder._has_filter("scale_d3d11"):
-        print("gpu-d3d11: this ffmpeg has no scale_d3d11 filter, skipping")
-        modes.remove("gpu-d3d11")
-
     hw_decoder.log_exception = _quiet_log
     _app = QCoreApplication.instance() or QCoreApplication([])
     begin_precise_timer()
@@ -332,21 +347,28 @@ def main() -> int:
         if args.quick:
             return 1 if failures else 0
 
-        print("\nCompositor stops taking frames: the decoder must keep reading at real time")
+        depth = queue_depth(args.fps)
+        print(
+            f"\nNothing takes frames for 3 s, then a compositor starts: the decoder fills its "
+            f"{depth}-frame queue, waits (ffmpeg not killed), then carries on in order"
+        )
         for mode in modes:
-            fps_read = measure_stalled_consumer(mode, args.clip, args.fps, width, height, 3.0)
-            if fps_read is None:
+            result = measure_stalled_consumer(mode, args.clip, args.fps, width, height, 3.0)
+            if result is None:
                 continue
-            speed = fps_read / args.fps
-            if speed < 0.5:
-                verdict = "BLOCKED (picture would freeze)"
+            read, alive, first = result
+            in_order = bool(first) and first[0] == 1 and all(
+                b is not None and a is not None and b - a == 1 for a, b in zip(first, first[1:])
+            )
+            ok = read <= depth + 1 and alive and in_order
+            if not ok:
                 failures += 1
-            elif speed > SPEED_OK[1]:
-                verdict = "TOO FAST"
-                failures += 1
-            else:
-                verdict = "OK, still reading"
-            print(f"  {mode:<11}  {fps_read:8.1f} frames/s   {speed:4.2f}x   {verdict}")
+            verdict = "OK" if ok else "FAILED"
+            print(
+                f"  {mode:<11}  read {read} frames while nobody took them, ffmpeg "
+                f"{'still running' if alive else 'KILLED'}, then frames "
+                f"{first[:4]}... {'in order' if in_order else 'OUT OF ORDER'}   {verdict}"
+            )
 
         print("\nPause for 2 s, then resume: no catch-up rush after the pause")
         for mode in modes:

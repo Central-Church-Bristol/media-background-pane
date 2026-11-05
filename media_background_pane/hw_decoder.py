@@ -264,20 +264,24 @@ def _vf(width: int, height: int, fps: int, mode: str, flags: str) -> str:
     already the output size, scale and crop pass frames straight through at
     no cost (measured 5 Nov 2026). out_color_matrix converts clips tagged with
     another matrix (SD BT.601, say); BT.709 clips pass through unchanged.
+
+    threads=1: by default swscale splits each frame across every core. Paced at
+    24 fps on a busy PC, that cost 0.1 to 1.3 cores for a 540p scale, swinging
+    from run to run; on one thread it stayed about 0.1.
     """
     rate = f"fps={max(1, fps)}"
+    common = f"flags={flags}:out_color_matrix=bt709:threads=1"
     if mode == SCALE_FILL:
         size = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase:force_divisible_by=2:"
-            f"flags={flags}:out_color_matrix=bt709,crop={width}:{height}"
+            f"{common},crop={width}:{height}"
         )
     elif mode == SCALE_ACTUAL:
-        size = f"scale=out_color_matrix=bt709,{_crop_pad(width, height)}"
+        size = f"scale=out_color_matrix=bt709:threads=1,{_crop_pad(width, height)}"
     else:
         size = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2:"
-            f"flags={flags}:out_color_matrix=bt709,"
-            f"pad={width}:{height}:trunc((ow-iw)/4)*2:trunc((oh-ih)/4)*2:black"
+            f"{common},pad={width}:{height}:trunc((ow-iw)/4)*2:trunc((oh-ih)/4)*2:black"
         )
     return f"{rate},{size},format=nv12"
 
