@@ -58,7 +58,7 @@ class World:
             "native_window_rect": lambda hwnd: self.rects.get(hwnd),
             "show_window_no_activate": lambda hwnd: self.visible.__setitem__(hwnd, True),
             "restore_window_no_activate": lambda hwnd: self.minimized.discard(hwnd),
-            "propresenter_main_window": lambda: self.pp_window,
+            "propresenter_main_window": lambda *_known_pids: self.pp_window,
             "stack_window_above": lambda hwnd, pp: self.stacked.append((hwnd, pp)),
             "video_input_layer_active": lambda: self.layer_active,
             "trigger_first_video_input": self._trigger,
@@ -102,6 +102,31 @@ class FakeTimer:
         self.active = False
 
 
+class InlineCalls:
+    """MainWindow's BackgroundCalls without its thread: each call runs at once and is answered at once.
+
+    The real one, with its thread, is tested in test_gui_thread.py.
+    """
+
+    def __init__(self) -> None:
+        self._waiting: dict[str, int] = {}
+
+    def busy(self, *kinds: str) -> bool:
+        return any(self._waiting.get(kind, 0) for kind in kinds)
+
+    def submit(self, kind, call, on_done=None, *, single=True, failed=None) -> bool:
+        if single and self.busy(kind):
+            return False
+        self._waiting[kind] = self._waiting.get(kind, 0) + 1
+        try:
+            result = call()
+        finally:
+            self._waiting[kind] -= 1
+        if on_done is not None:
+            on_done(result)
+        return True
+
+
 class Pane:
     """MainWindow's show/hide, ProPresenter and Video Input code, on fake windows."""
 
@@ -115,8 +140,10 @@ class Pane:
     _note_attached = MainWindow._note_attached
     _pane_is_on_screen = MainWindow._pane_is_on_screen
     _try_trigger_video_input = MainWindow._try_trigger_video_input
+    _video_input_attempted = MainWindow._video_input_attempted
     _rearm_video_input = MainWindow._rearm_video_input
     _toggle_video_input = MainWindow._toggle_video_input
+    _video_input_toggled = MainWindow._video_input_toggled
     show_pane_on_top = MainWindow.show_pane_on_top
     _tray_actions = MainWindow._tray_actions
     _menu_actions = MainWindow._menu_actions
@@ -141,6 +168,9 @@ class Pane:
         self._taskbar_owner = None
         self._video_input_triggered = False
         self._video_input_ignore_until = 0.0
+        self._video_input_serial = 0
+        self._video_input_known = False
+        self._pp_calls = InlineCalls()
         self._video_input_timer = FakeTimer()
         self._video_input_timer.start()
         self.video_input_button = SimpleNamespace(isChecked=lambda: self.button_wants_on)

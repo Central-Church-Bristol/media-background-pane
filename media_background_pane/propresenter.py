@@ -205,8 +205,14 @@ def is_propresenter_running() -> bool:
     return bool(propresenter_pids())
 
 
-def propresenter_main_window() -> tuple[int, tuple[int, int, int, int]] | None:
-    pids = set(propresenter_pids())
+def propresenter_main_window(known_pids=None) -> tuple[int, tuple[int, int, int, int]] | None:
+    """ProPresenter's biggest visible window, as (hwnd, rect), or None.
+
+    known_pids: ProPresenter's process ids, if the caller has them already.
+    Otherwise a process snapshot is taken, which cost 7 ms on 5 Nov 2026
+    (256 processes); looking through the windows costs 0.4 ms.
+    """
+    pids = set(propresenter_pids() if known_pids is None else known_pids)
     if not pids:
         return None
     best_hwnd = 0
@@ -245,13 +251,13 @@ def propresenter_main_window() -> tuple[int, tuple[int, int, int, int]] | None:
     return best_hwnd, best_rect
 
 
-def propresenter_window_rect() -> tuple[int, int, int, int] | None:
-    found = propresenter_main_window()
+def propresenter_window_rect(known_pids=None) -> tuple[int, int, int, int] | None:
+    found = propresenter_main_window(known_pids)
     return found[1] if found else None
 
 
-def propresenter_main_hwnd() -> int | None:
-    found = propresenter_main_window()
+def propresenter_main_hwnd(known_pids=None) -> int | None:
+    found = propresenter_main_window(known_pids)
     return found[0] if found else None
 
 
@@ -565,8 +571,15 @@ def _video_input_duration(duration_seconds: float | None) -> float:
 
 
 # ProPresenter's API address, per run (process id). The Video Input button
-# asks ProPresenter for its status every second from the GUI thread; probing
-# every port each time made that several requests a second.
+# asks ProPresenter for its status every second; probing every port each time
+# made that several requests a second.
+#
+# find_api_base() and everything below it ask ProPresenter over HTTP. The
+# pane calls them only from its ProPresenter thread (main_window's
+# BackgroundCalls), one call at a time, so this cache needs no lock. Never call it from the GUI thread: a request can
+# wait 0.8 s, and on Windows a port with nothing listening on 127.0.0.1 is not
+# refused at once but also waits the whole 0.8 s. So until ProPresenter's API
+# is up, find_api_base() takes 2.4 s (three ports) every time.
 _api_bases: dict[int, str] = {}
 
 

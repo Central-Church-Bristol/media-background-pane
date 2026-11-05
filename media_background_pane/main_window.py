@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import queue
+import sys
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty
 from time import monotonic
@@ -8,12 +13,15 @@ from PySide6.QtCore import (
     QBuffer,
     QFileSystemWatcher,
     QIODevice,
+    QObject,
     QPoint,
     QPointF,
     QRect,
     QSize,
     Qt,
     QTimer,
+    Signal,
+    Slot,
 )
 from PySide6.QtGui import QColor, QGuiApplication, QIcon, QImage, QPainter, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
@@ -42,7 +50,7 @@ from .library import (
     media_files,
     thumb_cache_path,
 )
-from .log import Throttle, log_event
+from .log import Throttle, log_event, log_exception
 from .priority import prefer_livestream_apps
 from .propresenter import (
     PATH_SETTINGS,
@@ -199,6 +207,293 @@ def _pid_list(pids) -> str:
     return ", ".join(f"P{pid}" for pid in pids)
 
 
+# The MIX and DIM fades tick every 8 ms on the GUI thread, so anything that
+# blocks it makes a fade stop and start. notes/gui-thread.md has what used to
+# block it and for how long.
+
+
+class BackgroundCalls(QObject):
+    """Slow calls, run one at a time on a thread of their own instead of the GUI thread.
+
+    submit() is called on the GUI thread. The call runs on this object's
+    thread, in the order submitted, and on_done(result) then runs back on the
+    GUI thread, through a queued signal.
+
+    A call of a kind that is already waiting or running is skipped (single,
+    the default), so a slow ProPresenter or Google Drive cannot make requests
+    pile up. If the call raises, the error is logged and on_done gets
+    `failed` instead. If the thread itself has ended, the next submit()
+    starts a new one and says so in the session log.
+    """
+
+    _finished = Signal(object)
+
+    def __init__(self, name: str) -> None:
+        # No Qt parent, so Qt never deletes this object while its thread can
+        # still be in a request and emit _finished afterwards.
+        super().__init__()
+        self.name = name
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._waiting: dict[str, int] = {}  # kind -> calls waiting or running; GUI thread only
+        self._stopped = False
+        self._finished.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
+        self._thread = self._start_thread()
+
+    def busy(self, *kinds: str) -> bool:
+        """Whether a call of any of these kinds is waiting or running."""
+        return any(self._waiting.get(kind, 0) > 0 for kind in kinds)
+
+    def submit(self, kind: str, call, on_done=None, *, single: bool = True, failed=None) -> bool:
+        """Queue call(). False if it was skipped: one of its kind is already waiting or running, or stop() was called."""
+        if self._stopped:
+            return False
+        self._keep_alive()
+        if single and self.busy(kind):
+            return False
+        self._waiting[kind] = self._waiting.get(kind, 0) + 1
+        self._jobs.put((kind, call, on_done, failed))
+        return True
+
+    def stop(self, wait: float = 0.0) -> None:
+        """Take no more calls. One already running finishes, but its result is dropped."""
+        self._stopped = True
+        self._jobs.put(None)
+        if wait > 0:
+            self._thread.join(wait)
+
+    def thread_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def _start_thread(self) -> threading.Thread:
+        thread = threading.Thread(target=self._run, args=(self._jobs,), name=f"{self.name} calls", daemon=True)
+        thread.start()
+        return thread
+
+    def _keep_alive(self) -> None:
+        try:
+            alive = self._thread.is_alive()
+        except Exception:
+            return  # cannot tell; leave it
+        if alive:
+            return
+        # Calls it had taken are lost with it, so nothing of theirs is waiting any more.
+        log_event(f"{self.name} thread", "it had stopped; started it again")
+        self._jobs = queue.SimpleQueue()
+        self._waiting.clear()
+        self._thread = self._start_thread()
+
+    def _run(self, jobs: queue.SimpleQueue) -> None:
+        while True:
+            job = jobs.get()
+            if job is None or self._stopped:
+                return
+            kind, call, on_done, failed = job
+            try:
+                result = call()
+            except Exception as exc:
+                log_exception(f"{self.name} thread: {kind}", exc)
+                result = failed
+            if self._stopped:
+                return
+            try:
+                self._finished.emit((kind, on_done, result))
+            except RuntimeError:
+                return  # this object is gone: the pane is closing
+
+    @Slot(object)
+    def _deliver(self, finished: tuple) -> None:
+        kind, on_done, result = finished
+        self._waiting[kind] = max(0, self._waiting.get(kind, 0) - 1)
+        if on_done is not None:
+            on_done(result)
+
+
+# Thumbnails the library thread makes itself, with QImageReader. A video's
+# first frame needs QMediaPlayer, which stays on the GUI thread (Thumbnailer).
+_STILL_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+
+@dataclass
+class LibraryScan:
+    """What the library thread found in the media folder."""
+
+    folder: Path | None
+    folder_ok: bool  # set, and a folder
+    files: list[Path] = field(default_factory=list)
+    thumb_names: list[str] = field(default_factory=list)  # each file's thumbnail cache name, for the iPad
+    thumbs: dict[str, QImage] = field(default_factory=dict)  # thumbnails already made, by path
+
+
+def scan_library(folder: Path | None, recursive: bool, extra: list[Path] | None = None) -> LibraryScan:
+    """Everything the library needs from the disk: the media files and their thumbnails.
+
+    Runs on the library thread. The folder is on Google Drive. Each file
+    costs a stat and a resolve() for its thumbnail's cache name, and the
+    cached thumbnail is read here too. extra: files just copied in, kept
+    even if the folder listing does not show them yet.
+    """
+    folder_ok = folder is not None and folder.is_dir()
+    paths = media_files(folder, recursive) if folder_ok else []
+    if extra:
+        known = {str(path) for path in paths}
+        for path in extra:
+            if str(path) in known or not path.is_file():
+                continue
+            paths.append(path)
+            known.add(str(path))
+        paths.sort(key=lambda item: item.name.casefold())
+    scan = LibraryScan(folder, folder_ok, paths)
+    for path in paths:
+        cache = thumb_cache_path(path)
+        scan.thumb_names.append(cache.name)
+        image = QImage(str(cache)) if cache.is_file() else QImage()
+        if image.isNull() and path.suffix.lower() in _STILL_SUFFIXES:
+            image = image_thumbnail(path)
+        if not image.isNull():
+            scan.thumbs[str(path)] = image
+    return scan
+
+
+def _make_awake_clock():
+    """A clock in seconds that stops while the PC sleeps (QueryUnbiasedInterruptTime).
+
+    So a suspend in the middle of a service is not taken for a blocked GUI
+    thread. Falls back to monotonic() if Windows will not give it.
+    """
+    try:
+        query = ctypes.WinDLL("kernel32").QueryUnbiasedInterruptTime
+        query.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
+        query.restype = ctypes.c_int
+        if not query(ctypes.byref(ctypes.c_ulonglong())):
+            return monotonic
+    except (AttributeError, OSError):
+        return monotonic
+
+    def awake() -> float:
+        ticks = ctypes.c_ulonglong()  # one per call: the watcher thread reads the clock too
+        query(ctypes.byref(ticks))
+        return ticks.value / 10_000_000  # 100 ns units
+
+    return awake
+
+
+awake_seconds = _make_awake_clock()
+
+
+def _thread_calls(ident: int, stop_at=None, limit: int = 5) -> str:
+    """The Python calls a running thread is in, innermost first: "f (a.py:3) < g (b.py:9)".
+
+    Stops at the frame stop_at (where the thread entered Qt's event loop), so
+    "" means the thread is running no Python code of its own. Never raises.
+    """
+    try:
+        frame = sys._current_frames().get(ident)
+        calls = []
+        while frame is not None and frame is not stop_at and len(calls) < limit:
+            code = frame.f_code
+            name = code.co_filename.replace("/", "\\").rsplit("\\", 1)[-1]
+            calls.append(f"{code.co_name} ({name}:{frame.f_lineno})")
+            frame = frame.f_back
+        return " < ".join(calls)
+    except Exception:
+        return "?"
+
+
+def _seconds(value: float) -> str:
+    return f"{value:.1f} s" if value < 10 else f"{value:.0f} s"
+
+
+class GuiStallDetector(QObject):
+    """Logs a line when the GUI thread was blocked: for how long, and where.
+
+    A timer here should fire every interval. When it fires much later, the
+    GUI thread was busy with something else for that long, and the MIX and
+    DIM fades, which tick on the GUI thread, stood still. Meanwhile a watcher
+    thread looks at the GUI thread and notes the Python code it is in.
+
+    The block began somewhere in the interval before the late beat, so it
+    lasted the gap between beats less half an interval, give or take half an
+    interval (0.05 s). A line is written when that is over threshold. Lines
+    go through a Throttle: five a minute at most; beyond that they are
+    counted, and the count goes in with the next line that has room. Time
+    with the PC asleep does not count.
+    """
+
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        interval: float = 0.1,
+        threshold: float = 0.25,
+        events: Throttle | None = None,
+        clock=None,
+    ) -> None:
+        super().__init__(parent)
+        self.interval = interval
+        self.threshold = threshold
+        self._events = events or Throttle(60.0, burst=5)
+        self._clock = clock or awake_seconds
+        self._last = self._clock()
+        self._gui_ident = threading.get_ident()  # made on the GUI thread
+        self._loop_frame = None  # where the GUI thread is in Python while it waits in Qt's event loop
+        self._sample: tuple[float, str] | None = None  # (the late beat's start, where the GUI thread was)
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)  # like the fades' own timer
+        self._timer.setInterval(max(1, round(interval * 1000)))
+        self._timer.timeout.connect(self._beat)
+        self._stop = threading.Event()
+        self._watcher: threading.Thread | None = None
+
+    def start(self, *, watch: bool = True) -> None:
+        self._last = self._clock()
+        self._timer.start()
+        if watch and self._watcher is None:
+            self._stop.clear()
+            self._watcher = threading.Thread(target=self._watch, name="gui stall watch", daemon=True)
+            self._watcher.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self._stop.set()
+        watcher, self._watcher = self._watcher, None
+        if watcher is not None:
+            watcher.join(1.0)
+
+    def _beat(self) -> None:
+        now = self._clock()
+        last, self._last = self._last, now
+        try:
+            # Called from Qt's event loop, so the frame below is the one waiting in it.
+            self._loop_frame = sys._getframe(1)
+        except ValueError:
+            self._loop_frame = None
+        blocked = now - last - self.interval / 2
+        if blocked > self.threshold:
+            sample = self._sample
+            where = sample[1] if sample is not None and sample[0] == last else None
+            self._events.event("blocked", "gui", self._message(blocked, where))
+        self._events.flush()
+
+    @staticmethod
+    def _message(blocked: float, where: str | None) -> str:
+        text = f"the window thread was blocked for {_seconds(blocked)}"
+        if where is None:
+            return text
+        if not where:
+            return f"{text}; it was running no Python code (Qt's own work, or waiting for another thread)"
+        return f"{text}; it was in {where}"
+
+    def _watch(self) -> None:
+        while not self._stop.wait(self.interval / 2):
+            last = self._last
+            if self._clock() - last <= self.threshold:
+                continue
+            sample = self._sample
+            if sample is not None and sample[0] == last:
+                continue  # this one is looked at already
+            self._sample = (last, _thread_calls(self._gui_ident, self._loop_frame))
+
+
 class MainWindow(QWidget):
     def __init__(self, config: Config, startup_mode: bool = False) -> None:
         super().__init__()
@@ -237,9 +532,24 @@ class MainWindow(QWidget):
         self._dim_animating = False
         self._video_input_triggered = False
         self._video_input_ignore_until = 0.0
+        # Moves on whenever the Video Input state may have changed: the
+        # operator's click, the start-up switch-on, a new ProPresenter run.
+        # Answers to requests sent before that are out of date.
+        self._video_input_serial = 0
+        # What ProPresenter last said, or the last change it took.
+        self._video_input_known = False
         self._lan_server = None
         self._lan_hub = None
         self._lan_files: list[dict] = []
+        # ProPresenter's API and the process snapshot for priorities, off the
+        # GUI thread. A status request can wait 0.8 s, and finding the API
+        # while ProPresenter starts waited 2.4 s.
+        self._pp_calls = BackgroundCalls("propresenter")
+        # The media folder is on Google Drive: its scans and copies.
+        self._library_calls = BackgroundCalls("library")
+        self._library_rescan = False
+        self._library_extra: list[Path] = []
+        self._stall_detector = GuiStallDetector(self)
 
         self.setObjectName("Root")
         self.setWindowTitle("Media Background Pane")
@@ -407,6 +717,7 @@ class MainWindow(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_lan_remote)
+            app.aboutToQuit.connect(self._stop_background_work)
         self._restore_geometry()
         self.refresh_library()
         self._update_fade_enabled()
@@ -437,6 +748,12 @@ class MainWindow(QWidget):
         QTimer.singleShot(400, self._sync_video_input_status)
         self._video_input_status_timer.start()
         self._start_lan_remote()
+        self._stall_detector.start()
+
+    def _stop_background_work(self) -> None:
+        self._stall_detector.stop()
+        self._pp_calls.stop()
+        self._library_calls.stop()
 
     def _apply_window_flags(self) -> None:
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -497,8 +814,14 @@ class MainWindow(QWidget):
         if not self.config.always_on_top:
             set_window_owner(hwnd, int(self._taskbar_owner.winId()))
 
+    # The window code below looks for ProPresenter's window up to ten times a
+    # second. It looks among the process ids the workspace check found last
+    # (self._pp_pids, once a second): a process snapshot each time cost 7 ms
+    # of the GUI thread (5 Nov 2026, 256 processes), and looking through the
+    # windows alone costs 0.4 ms. Before the first check, None takes a snapshot.
+
     def _pp_rect(self) -> QRect | None:
-        raw = propresenter_window_rect()
+        raw = propresenter_window_rect(self._pp_pids)
         if not raw:
             return None
         left, top, right, bottom = raw
@@ -520,7 +843,7 @@ class MainWindow(QWidget):
 
     def _dock_anchor_native(self) -> tuple[int, int]:
         our = native_window_rect(self._native_hwnd())
-        pp = propresenter_window_rect()
+        pp = propresenter_window_rect(self._pp_pids)
         if pp is not None:
             return pp[0], pp[3]
         if our is not None:
@@ -576,7 +899,7 @@ class MainWindow(QWidget):
     def _snap_to_propresenter(self) -> bool:
         if self._resizing:
             return False
-        pp = propresenter_window_rect()
+        pp = propresenter_window_rect(self._pp_pids)
         if pp is None:
             return False
         our = native_window_rect(self._native_hwnd())
@@ -606,7 +929,7 @@ class MainWindow(QWidget):
             return
         dummy = int(self._taskbar_owner.winId()) if self._taskbar_owner is not None else 0
         if self.config.always_on_top and (self._shown_for_workspace or self._shown_by_hand):
-            found = propresenter_main_window()
+            found = propresenter_main_window(self._pp_pids)
             if found:
                 stack_window_above(hwnd, found[0])
             else:
@@ -786,45 +1109,55 @@ class MainWindow(QWidget):
             self._snap_to_propresenter()
 
     def refresh_library(self, extra: list[Path] | None = None) -> None:
-        folder = Path(self.config.media_folder) if self.config.media_folder else None
-        paths: list[Path] = []
-        watched = set(self._folder_watcher.directories())
-        for path in list(watched):
-            if path != str(PATH_SETTINGS.parent):
-                self._folder_watcher.removePath(path)
-        if folder and folder.is_dir():
-            paths = media_files(folder, self.config.include_subfolders)
-            self._folder_watcher.addPath(str(folder))
-            self.thumbs.set_empty_hint("Drop images or videos here")
-        else:
-            self.thumbs.set_empty_hint("Set a media folder in Settings, or drop files here")
+        """Scan the media folder again, on the library thread; the strip and the iPad follow when it is back.
+
+        The folder is on Google Drive. On the GUI thread a scan took 60 ms,
+        up to 200 ms (5 Nov 2026, 28 files), and it runs whenever the folder
+        or ProPresenter's settings folder changes. A refresh asked for during
+        a scan runs once that scan is back. extra: files just copied in,
+        shown even if the folder listing does not have them yet.
+        """
         if extra:
-            known = {str(path) for path in paths}
-            for path in extra:
-                if str(path) in known or not path.is_file():
-                    continue
-                paths.append(path)
-                known.add(str(path))
-            paths.sort(key=lambda item: item.name.casefold())
-        self._files = paths
-        self.thumbs.set_files(paths)
-        self._lan_files = [
-            {
-                "path": str(path),
-                "name": path.name,
-                "thumb": f"/thumbs/{thumb_cache_path(path).name}",
-            }
-            for path in paths
-        ]
-        self._sync_thumb_roles()
-        for path in paths:
-            image = self.thumbnailer.request(path)
-            if image is not None:
-                self.thumbs.set_thumb(str(path), image)
-            elif path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}:
-                image = image_thumbnail(path)
-                if not image.isNull():
+            self._library_extra.extend(extra)
+        folder = Path(self.config.media_folder) if self.config.media_folder else None
+        recursive = bool(self.config.include_subfolders)
+        wanted = list(self._library_extra)
+        if self._library_calls.submit("scan", lambda: scan_library(folder, recursive, wanted), self._show_library):
+            self._library_extra = []
+            self._library_rescan = False
+        else:
+            self._library_rescan = True
+
+    def _show_library(self, scan: LibraryScan | None) -> None:
+        """Show a finished scan. None: it failed (the error is in the session log), so keep what is shown."""
+        if scan is not None:
+            for path in self._folder_watcher.directories():
+                if path != str(PATH_SETTINGS.parent):
+                    self._folder_watcher.removePath(path)
+            if scan.folder_ok:
+                self._folder_watcher.addPath(str(scan.folder))
+                self.thumbs.set_empty_hint("Drop images or videos here")
+            else:
+                self.thumbs.set_empty_hint("Set a media folder in Settings, or drop files here")
+            self._files = scan.files
+            self.thumbs.set_files(scan.files)
+            self._lan_files = [
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "thumb": f"/thumbs/{name}",
+                }
+                for path, name in zip(scan.files, scan.thumb_names)
+            ]
+            self._sync_thumb_roles()
+            for path in scan.files:
+                image = scan.thumbs.get(str(path))
+                if image is not None:
                     self.thumbs.set_thumb(str(path), image)
+                elif path.suffix.lower() not in _STILL_SUFFIXES:
+                    self.thumbnailer.request(path)  # a video with no thumbnail yet
+        if self._library_rescan:
+            self.refresh_library()
 
     def _import_dropped_files(self, paths: list[str]) -> None:
         folder = Path(self.config.media_folder) if self.config.media_folder else None
@@ -844,11 +1177,21 @@ class MainWindow(QWidget):
                 "Drop images or videos the pane can play (jpg, png, mp4, mov, and similar).",
             )
             return
+        # Copying a clip onto Google Drive can take many seconds: on the
+        # library thread, with the wait cursor up until it is done.
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            copied, errors = copy_into_folder(sources, folder)
-        finally:
+        if not self._library_calls.submit(
+            "copy",
+            lambda: copy_into_folder(sources, folder),
+            self._dropped_files_copied,
+            single=False,
+            failed=([], [source.name for source in sources]),
+        ):
             QApplication.restoreOverrideCursor()
+
+    def _dropped_files_copied(self, result: tuple[list[Path], list[str]]) -> None:
+        QApplication.restoreOverrideCursor()
+        copied, errors = result
         self._ignore_folder_scan_until = monotonic() + 1.0
         self._scan_timer.stop()
         self.refresh_library(extra=copied)
@@ -873,22 +1216,51 @@ class MainWindow(QWidget):
             return
         self._scan_timer.start()
 
+    # Video Input. Every request to ProPresenter runs on the ProPresenter
+    # thread (self._pp_calls), one at a time, in the order asked; the answers
+    # are applied here on the GUI thread. An answer to a request sent before
+    # self._video_input_serial moved on is out of date, and is dropped.
+
     def _try_trigger_video_input(self) -> None:
-        """Once per ProPresenter run: switch its first video input on (retried every 2 s)."""
+        """Once per ProPresenter run: switch its first video input on (retried every 2 s).
+
+        An attempt still waiting or running is not started again, and none
+        starts while the operator's own switch is on its way.
+        """
         if self._video_input_triggered:
             self._video_input_timer.stop()
             return
-        status = video_input_layer_active()
-        if status is True:
-            self._video_input_triggered = True
-            self._video_input_timer.stop()
-            self._set_video_input_button(True)
-            log_event("video input", "already on in ProPresenter")
+        if self._pp_calls.busy("toggle"):
             return
-        if trigger_first_video_input():
-            self._video_input_triggered = True
-            self._video_input_timer.stop()
-            self._set_video_input_button(True)
+        serial = self._video_input_serial
+
+        def still_wanted() -> bool:
+            # Read on the ProPresenter thread. False once the operator has
+            # switched the input, or ProPresenter has restarted, since.
+            return self._video_input_serial == serial
+
+        def attempt() -> str | None:
+            if not still_wanted():
+                return None
+            if video_input_layer_active() is True:
+                return "already on"
+            if not still_wanted():
+                return None
+            return "switched on" if trigger_first_video_input() else None
+
+        self._pp_calls.submit("attempt", attempt, lambda outcome: self._video_input_attempted(outcome, serial))
+
+    def _video_input_attempted(self, outcome: str | None, serial: int) -> None:
+        if outcome is None or serial != self._video_input_serial or self._video_input_triggered:
+            return
+        self._video_input_triggered = True
+        self._video_input_timer.stop()
+        self._video_input_serial += 1  # a status asked for before this is out of date
+        self._video_input_known = True
+        self._set_video_input_button(True)
+        if outcome == "already on":
+            log_event("video input", "already on in ProPresenter")
+        else:
             log_event("video input", "switched ProPresenter's first video input on")
 
     def _rearm_video_input(self) -> None:
@@ -899,16 +1271,30 @@ class MainWindow(QWidget):
         """
         self._video_input_triggered = False
         self._video_input_ignore_until = 0.0
+        self._video_input_serial += 1  # answers about the run that ended no longer count
         if not self._video_input_timer.isActive():
             self._video_input_timer.start()
         log_event("video input", "new ProPresenter run: will switch its first video input on")
 
     def _sync_video_input_status(self) -> None:
+        """Once a second: the button follows ProPresenter. Skipped while the last request is still out."""
         if monotonic() < self._video_input_ignore_until:
             return
-        active = video_input_layer_active()
-        if active is None:
+        if self._pp_calls.busy("toggle"):
             return
+        serial = self._video_input_serial
+        self._pp_calls.submit(
+            "status",
+            lambda: video_input_layer_active(),
+            lambda active: self._video_input_status(active, serial),
+        )
+
+    def _video_input_status(self, active: bool | None, serial: int) -> None:
+        if active is None or serial != self._video_input_serial:
+            return
+        if monotonic() < self._video_input_ignore_until:
+            return
+        self._video_input_known = active
         if active != self.video_input_button.isChecked():
             self._set_video_input_button(active)
 
@@ -926,30 +1312,45 @@ class MainWindow(QWidget):
             self.video_input_button.setToolTip("Fade on the first ProPresenter video input")
 
     def _toggle_video_input(self) -> None:
+        """The operator's click on Video Input (or the iPad's): switch it on or off.
+
+        The button shows the choice at once. The request goes after any
+        already on the ProPresenter thread; if ProPresenter does not take it,
+        the button goes back to what ProPresenter last said.
+        """
         want_on = self.video_input_button.isChecked()
         duration = self.config.fade_seconds
+        self._video_input_serial += 1  # earlier status answers and attempts no longer count
+        serial = self._video_input_serial
+        self._set_video_input_button(want_on)
         if want_on:
-            ok = trigger_first_video_input(duration)
-            if ok:
-                self._video_input_triggered = True
-                self._video_input_timer.stop()
-                self._video_input_ignore_until = monotonic() + max(1.5, duration + 0.3)
-                self._set_video_input_button(True)
-                log_event("video input", "switched on by the operator")
-            else:
-                self._set_video_input_button(False)
+            call = lambda: trigger_first_video_input(duration)  # noqa: E731
         else:
             # The operator's choice holds for this ProPresenter run: do not
             # switch the input back on, even if the start-up attempt is still retrying.
             self._video_input_triggered = True
             self._video_input_timer.stop()
-            ok = clear_video_input_layer(duration)
-            if ok:
+            call = lambda: clear_video_input_layer(duration)  # noqa: E731
+        self._pp_calls.submit(
+            "toggle",
+            call,
+            lambda ok: self._video_input_toggled(want_on, bool(ok), serial, duration),
+            single=False,
+            failed=False,
+        )
+
+    def _video_input_toggled(self, want_on: bool, ok: bool, serial: int, duration: float) -> None:
+        latest = serial == self._video_input_serial  # no later click, and the same ProPresenter run
+        if ok:
+            self._video_input_known = want_on
+            log_event("video input", "switched on by the operator" if want_on else "switched off by the operator")
+            if latest:
+                if want_on:
+                    self._video_input_triggered = True
+                    self._video_input_timer.stop()
                 self._video_input_ignore_until = monotonic() + max(1.5, duration + 0.3)
-                self._set_video_input_button(False)
-                log_event("video input", "switched off by the operator")
-            else:
-                self._set_video_input_button(True)
+        if latest:
+            self._set_video_input_button(self._video_input_known)
 
     def _on_thumb_scale(self, width: int) -> None:
         self.config.thumb_scale = width
@@ -1355,7 +1756,8 @@ class MainWindow(QWidget):
         self._events.event("window", "pane window", f"{look}; {where}; {whose}")
 
     def _check_workspace(self) -> None:
-        prefer_livestream_apps()
+        # Its process snapshot cost 7 ms of the GUI thread a second.
+        self._pp_calls.submit("priority", lambda: prefer_livestream_apps())
         pids = self._read_propresenter()
         show, why = self._workspace_decision(pids)
         if show is True and self._shown_by_hand:
