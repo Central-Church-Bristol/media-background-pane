@@ -1,6 +1,6 @@
 # Smooth 1080p playback: the rebuilt pipeline (5 Nov 2026)
 
-Branch `worktree-perf-1080p`. Nothing is in the main folder yet, so the running pane still has the old code. `perf-plan.md` has the plan and the measurements that led to it. `gui-thread.md` covers the GUI-thread half of the work.
+Branch `worktree-perf-1080p`, installed in the main folder on 5 Nov 2026 at 22:21 by a fast-forward of `main`, and running since the pane restarted at 22:48 (see "Installed" below). `perf-plan.md` has the plan and the measurements that led to it. `gui-thread.md` covers the GUI-thread half of the work.
 
 ## What was wrong
 
@@ -129,7 +129,42 @@ These ran while the PC was busy with other tests, so the CPU numbers are on the 
 - a hung ffmpeg is restarted after 9.2 s, by its 8-second rule;
 - ordinary use causes no false repairs.
 
-**Tests:** 127 pass.
+**Tests:** 128 pass.
+
+## Installed (5 Nov 2026)
+
+- **What changed:** `main` was fast-forwarded from 02527b9 to this branch, and the main folder with it.
+  - The main folder had held the 2–4 Nov fixes, uncommitted. They are this branch's first commit, 306194f, and were checked file by file before anything was replaced.
+  - A local branch, `before-1080p`, points at 306194f: the old version.
+- **Restarted at 22:48**, once the user gave the go-ahead in this session. Claude's safety check had refused while the go-ahead came through another session.
+  - The old pane (pid 22024, started 4 Nov 23:20) was closed without force. WM_CLOSE to its window closed the engine (`stop:` logged), then WM_CLOSE to its tray window quit the app.
+  - The new one was started through `Media Background Pane.exe`, as the Start menu does.
+
+Checked first, without touching the running pane:
+- **The whole app, started in isolation:** this code, with its own settings, log, NDI name ("MBP bench startup", in a private group) and LAN port. Start with Windows was off, so the start-up entry was never touched.
+  - **Settings and status:** the saved 540p moved to 1080p (settings revision 3). The decoder showed "GPU (NVDEC)" and NDI sent 1920×1080. The LAN remote answered. The window stayed hidden, as it should with ProPresenter closed.
+  - **Through real NDI:** clip A on Program and B on Preview, MIX at 0.5 for 25 s, and two Takes. A receiver in another process got 1036 frames, and every one was the next frame of each clip: 842 pairs each, with no repeats or skips.
+  - **CPU with MIX at 0.5:** 59% of one core in all (the pane 16%, the two ffmpeg processes 42%). That is 3.7% of the PC.
+  - **Its session.log:** only its start, watchdog, ProPresenter and window lines, then `stop:`. It quit cleanly.
+- **After switching, from the main folder:**
+  - the code imports with the pane's own Python (OpenCV 5.0.0);
+  - `tests/check_playback_speed.py` on Holy Fire through NVDEC: 1.00×, a new frame on all 193 ticks, none skipped, ffmpeg 0.22 cores;
+  - the unit tests: all 128 pass.
+- **Live, on the restarted pane.** The user's OK covered loading clips through its remote for this.
+  - **Idle:** NDI "Media Background Pane" at 1920×1080, 24.1 frames a second, never more than 43.1 ms apart. The remote answered.
+  - **Two clips blended:** Holy Fire was loaded and auto-faded in, then Leaves went to Preview with MIX held at 0.5. Over 30 s the NDI feed brought 721 frames at 24.01 a second. Every one differed from the one before, so none was shown twice. The gap between frames was 46.3 ms at p99 and 47.5 ms at most.
+  - **CPU with MIX at 0.5:** 48% of one core in all (the pane 25%, the two ffmpeg processes 23%). That is 3.0% of the PC.
+  - **session.log:** only its start-up lines. No late frames, window-thread stalls or decoder trouble.
+  - **Left empty:** restarted once more at 22:52, so nothing is loaded, as before. Its settings are now saved as 1080p (revision 3), and no ffmpeg was left running.
+
+### Going back
+
+1. **Quickest:** Settings → Quality → 540p, and set ProPresenter's input back to 960×540. The new code then runs at the old size.
+2. **The old code:**
+   - Quit the pane from the tray.
+   - In the main folder, run `git switch before-1080p`.
+   - Start the pane from the Start menu, then set Settings → Quality → 540p, because the old code keeps the 1080p setting.
+   - `git switch main` comes back to this version.
 
 ## After switching to the new version
 

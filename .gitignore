@@ -8,3 +8,7 @@ thumbs/
 *.log
 vendor/ffmpeg/*
 !vendor/ffmpeg/.gitkeep
+# Built here by build_launcher.py
+/Media Background Pane.exe
+# Claude Code's working copies
+.claude/worktrees/
