@@ -37,11 +37,7 @@ Supported files: `.jpg` `.jpeg` `.png` `.webp` `.bmp` `.tif` `.tiff` `.gif` `.mp
 
 Double-click `run.bat`. The first launch creates `.venv`, installs dependencies from `requirements.txt`, and downloads ffmpeg if it is not already present.
 
-Or, after the venv exists:
-
-```bat
-.venv\Scripts\pythonw.exe main.py
-```
+After that, start `Media Background Pane.exe` (put a shortcut to it in the Start menu; the exe has to stay in this folder). Python runs inside it, so Task Manager shows Media Background Pane, not Python, and Start with Windows runs it too. If it ever can't, it starts `.venv\Scripts\pythonw.exe` instead, and `session.log` says why. `build_launcher.py` rebuilds it (quit the pane first).
 
 Only one instance runs at a time.
 

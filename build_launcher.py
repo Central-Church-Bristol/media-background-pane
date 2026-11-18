@@ -2,6 +2,14 @@
 
 The exe has to stay in this folder, next to main.py. Shortcut that file
 into the Start menu; copying the exe somewhere else will not launch the app.
+
+Python runs inside the exe (18 Nov: launcher/Program.cs, CentraLight's
+launcher), so Task Manager shows Media Background Pane, not Python. It's built
+for 64-bit Windows, like the Python it runs, with Python's own pythonw.exe
+manifest (launcher/MediaBackgroundPane.manifest). Quit the pane before
+rebuilding: Windows won't replace the exe while the pane runs inside it.
+
+    .venv\\Scripts\\python.exe build_launcher.py
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ ROOT = Path(__file__).resolve().parent
 PNG = ROOT / "icon.png"
 ICO = ROOT / "launcher" / "icon.ico"
 SOURCE = ROOT / "launcher" / "Program.cs"
+MANIFEST = ROOT / "launcher" / "MediaBackgroundPane.manifest"
 EXE = ROOT / "Media Background Pane.exe"
 CSC = Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe")
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
@@ -91,7 +100,7 @@ def write_ico(image: QImage, path: Path) -> None:
     path.write_bytes(header + bytes(entries) + bytes(payload))
 
 
-def compile_exe() -> None:
+def compile_exe(out: Path = EXE, ico: Path = ICO) -> None:
     if not CSC.is_file():
         raise SystemExit(f"C# compiler not found: {CSC}")
     command = [
@@ -99,9 +108,11 @@ def compile_exe() -> None:
         "/nologo",
         "/target:winexe",
         "/optimize+",
-        f"/win32icon:{ICO}",
+        "/platform:x64",
+        f"/win32icon:{ico}",
+        f"/win32manifest:{MANIFEST}",
         "/reference:System.Windows.Forms.dll",
-        f"/out:{EXE}",
+        f"/out:{out}",
         str(SOURCE),
     ]
     result = subprocess.run(command, capture_output=True, text=True)

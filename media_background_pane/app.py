@@ -15,6 +15,7 @@ from .config import Config
 from .log import enable_crash_log, install_error_logging, log_event
 from .main_window import MainWindow, make_app_icon
 from .priority import prefer_livestream_apps
+from .startup import how_started, inside_launcher
 from .timing import begin_precise_timer, end_precise_timer
 
 
@@ -23,10 +24,13 @@ def _prepare_windows_shell() -> None:
         return
     import ctypes
 
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MediaBackgroundPane.1")
-    except OSError:
-        pass
+    # Inside Media Background Pane.exe (18 Nov), Windows already knows the process as the pane: Task
+    # Manager and the tray's notifications say so. Only a pythonw.exe of its own needs this ID.
+    if not inside_launcher():
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MediaBackgroundPane.1")
+        except OSError:
+            pass
     try:
         ctypes.windll.kernel32.FreeConsole()
     except OSError:
@@ -39,7 +43,7 @@ def main() -> None:
     enable_crash_log()
     # One line per start, so the log shows it works and when the pane started.
     launched = " --startup" if startup else ""
-    log_event("start", f"pid {os.getpid()}, {Path(sys.executable).name}{launched}, Python {platform.python_version()}")
+    log_event("start", f"pid {os.getpid()}, {how_started()}{launched}, Python {platform.python_version()}")
     _prepare_windows_shell()
     begin_precise_timer()
     prefer_livestream_apps()
